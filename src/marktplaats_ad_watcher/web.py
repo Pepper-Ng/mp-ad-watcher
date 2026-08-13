@@ -24,6 +24,7 @@ from marktplaats_ad_watcher.model_config import (
     provider_preset,
     resolved_model_environment,
 )
+from marktplaats_ad_watcher.models import EvaluatedAd
 from marktplaats_ad_watcher.status import RuntimeStatusStore
 
 EDITABLE_KEYS = [
@@ -241,6 +242,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             {_row("Model notify", status.total_notify_actions)}
           </table>
         </section>
+        <p><a href="/evaluations{token_query}">View evaluations</a></p>
         <p><a href="/config{token_query}">Edit configuration</a></p>
         <p><a href="/api/status{token_query}">Status JSON</a></p>
         """
@@ -255,6 +257,47 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
 
     async def health(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
+
+    async def evaluations(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+
+        action = _evaluation_action(request)
+        values = service.read_config()
+        evaluations = _read_evaluations(Path(values["RESULTS_FILE"]), action=action)
+        token_query = _token_query(request)
+        action_query = _query_with_token(request, action=action)
+        body = f"""
+        <section>
+          <form class="filter-form" method="get" action="/evaluations">
+            {_token_hidden_input(request)}
+            <label>Decision
+              <select name="action">
+                {_evaluation_filter_options(action)}
+              </select>
+            </label>
+            <button type="submit">Filter</button>
+          </form>
+          <p>{len(evaluations)} evaluation(s). Newest first.</p>
+          <p><a href="/api/evaluations{action_query}" download="evaluations.json">Download JSON</a>
+          </p>
+          {_evaluation_cards(evaluations)}
+        </section>
+        <p><a href="/{token_query}">Back to status</a></p>
+        """
+        return HTMLResponse(_page("Evaluations", body))
+
+    async def evaluations_json(request: Request) -> JSONResponse | PlainTextResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return PlainTextResponse("Unauthorized", status_code=401)
+
+        values = service.read_config()
+        evaluations = _read_evaluations(
+            Path(values["RESULTS_FILE"]), action=_evaluation_action(request)
+        )
+        return JSONResponse([evaluation.model_dump(mode="json") for evaluation in evaluations])
 
     async def config_get(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -449,6 +492,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/", index),
             Route("/healthz", health),
             Route("/api/status", status_json),
+            Route("/evaluations", evaluations),
+            Route("/api/evaluations", evaluations_json),
             Route("/config", config_get, methods=["GET"]),
             Route("/config", config_post, methods=["POST"]),
             Route("/run-now", run_now, methods=["POST"]),
@@ -476,6 +521,100 @@ def _deny_if_needed(request: Request, service: WatcherService) -> HTMLResponse |
 def _token_query(request: Request) -> str:
     token = request.query_params.get("token")
     return f"?{urlencode({'token': token})}" if token else ""
+
+
+def _query_with_token(request: Request, *, action: str) -> str:
+    values: dict[str, str] = {"action": action}
+    token = request.query_params.get("token")
+    if token:
+        values["token"] = token
+    return f"?{urlencode(values)}"
+
+
+def _token_hidden_input(request: Request) -> str:
+    token = request.query_params.get("token")
+    if not token:
+        return ""
+    return f"<input type='hidden' name='token' value='{escape(token)}'>"
+
+
+def _evaluation_action(request: Request) -> str:
+    action = request.query_params.get("action", "all").strip().lower()
+    return action if action in {"all", "notify", "review", "ignore"} else "all"
+
+
+def _read_evaluations(path: Path, *, action: str) -> list[EvaluatedAd]:
+    if not path.exists():
+        return []
+
+    evaluations: list[EvaluatedAd] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            evaluation = EvaluatedAd.model_validate_json(line)
+        except ValueError:
+            LOGGER.warning("Skipping an invalid evaluation record in %s.", path)
+            continue
+        if action == "all" or evaluation.result.next_action == action:
+            evaluations.append(evaluation)
+
+    return sorted(evaluations, key=lambda evaluation: evaluation.evaluated_at, reverse=True)
+
+
+def _evaluation_filter_options(selected_action: str) -> str:
+    options = [
+        ("all", "All decisions"),
+        ("notify", "Notify"),
+        ("review", "Review"),
+        ("ignore", "Ignore"),
+    ]
+    return "".join(
+        f"<option value='{value}'{' selected' if value == selected_action else ''}>{label}</option>"
+        for value, label in options
+    )
+
+
+def _evaluation_cards(evaluations: list[EvaluatedAd]) -> str:
+    if not evaluations:
+        return "<p>No evaluations match this filter yet.</p>"
+
+    cards = []
+    for evaluation in evaluations:
+        ad = evaluation.ad
+        result = evaluation.result
+        metadata = " · ".join(value for value in [ad.price, ad.location] if value)
+        signals = _evaluation_list("Signals", result.signals)
+        concerns = _evaluation_list("Concerns", result.concerns)
+        cards.append(
+            f"""
+            <article class="evaluation-card">
+              <div class="evaluation-heading">
+                                <span class="decision decision-{escape(result.next_action)}">
+                                    {escape(result.next_action)}
+                                </span>
+                <strong>{escape(ad.title)}</strong>
+              </div>
+                            <p><a href="{escape(ad.url)}" rel="noopener noreferrer" target="_blank">
+                                Open Marktplaats ad
+                            </a></p>
+              <p>{escape(metadata) if metadata else 'No price or location supplied.'}</p>
+              <p><strong>Confidence:</strong> {result.confidence:.2f}</p>
+              <p><strong>Reason:</strong> {escape(result.reason)}</p>
+              {signals}
+              {concerns}
+              <p class="hint">Evaluated {escape(evaluation.evaluated_at.isoformat())}</p>
+            </article>
+            """
+        )
+    return "".join(cards)
+
+
+def _evaluation_list(label: str, values: list[str]) -> str:
+    if not values:
+        return ""
+    items = "".join(f"<li>{escape(value)}</li>" for value in values)
+    return f"<p><strong>{escape(label)}:</strong></p><ul>{items}</ul>"
 
 
 def _warning_for_missing_token(service: WatcherService) -> str:
@@ -565,6 +704,27 @@ def _page(title: str, body: str) -> str:
             gap: 1rem;
             padding-top: 1rem;
         }}
+        .filter-form {{ align-items: end; display: flex; flex-wrap: wrap; gap: 0.75rem; }}
+        .filter-form label {{ min-width: 12rem; }}
+        .evaluation-card {{
+            border: 1px solid #d5d5d5;
+            border-radius: 6px;
+            margin: 1rem 0;
+            padding: 1rem;
+        }}
+        .evaluation-card p {{ margin: 0.55rem 0; }}
+        .evaluation-heading {{ align-items: center; display: flex; flex-wrap: wrap; gap: 0.6rem; }}
+        .decision {{
+            border-radius: 1rem;
+            color: white;
+            font-size: 0.8rem;
+            font-weight: 700;
+            padding: 0.2rem 0.55rem;
+            text-transform: uppercase;
+        }}
+        .decision-notify {{ background: #16733c; }}
+        .decision-review {{ background: #956500; }}
+        .decision-ignore {{ background: #5a5a5a; }}
         .warning {{
             background: #fff4ce;
             border: 1px solid #e0b100;

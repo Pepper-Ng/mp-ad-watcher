@@ -8,6 +8,8 @@ import httpx
 import pytest
 
 from marktplaats_ad_watcher.config import parse_dotenv, write_dotenv
+from marktplaats_ad_watcher.models import Ad, EvaluatedAd, EvaluationResult
+from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.web import ERROR_RETRY_SECONDS, WatcherService, create_web_app
 
 
@@ -313,6 +315,69 @@ async def test_environment_admin_token_authenticates_without_being_persisted(
     assert saved_response.status_code == 303
     assert allowed_after_save.status_code == 200
     assert "WEB_ADMIN_TOKEN" not in parse_dotenv(env_file)
+
+
+@pytest.mark.asyncio
+async def test_evaluations_page_filters_and_downloads_json(tmp_path: Path) -> None:
+    env_file = tmp_path / "settings.env"
+    results_file = tmp_path / "evaluations.jsonl"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "RESULTS_FILE": str(results_file),
+        },
+    )
+    store = SeenStore(tmp_path / "seen_ads.json")
+    store.append_result(
+        results_file,
+        EvaluatedAd(
+            ad=Ad(
+                id="m1",
+                title="Suitable freezer chest",
+                url="https://www.marktplaats.nl/v/m1",
+                price="EUR 125.00",
+                location="Eindhoven",
+            ),
+            result=EvaluationResult(
+                relevant=True,
+                confidence=0.9,
+                reason="Size matches.",
+                signals=["200 litre capacity"],
+                concerns=["Confirm pickup."],
+                next_action="notify",
+            ),
+        ),
+    )
+    store.append_result(
+        results_file,
+        EvaluatedAd(
+            ad=Ad(id="m2", title="Too small", url="https://www.marktplaats.nl/v/m2"),
+            result=EvaluationResult(
+                relevant=False,
+                confidence=0.95,
+                reason="Capacity is too small.",
+                next_action="ignore",
+            ),
+        ),
+    )
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/evaluations")
+        filtered_page = await client.get("/evaluations?token=admin-token&action=notify")
+        downloaded = await client.get("/api/evaluations?token=admin-token&action=notify")
+
+    assert denied.status_code == 401
+    assert filtered_page.status_code == 200
+    assert "Suitable freezer chest" in filtered_page.text
+    assert "Size matches." in filtered_page.text
+    assert "200 litre capacity" in filtered_page.text
+    assert "Too small" not in filtered_page.text
+    assert downloaded.status_code == 200
+    assert downloaded.json()[0]["result"]["next_action"] == "notify"
+    assert len(downloaded.json()) == 1
 
 
 @pytest.mark.asyncio
