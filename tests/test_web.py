@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -8,8 +9,14 @@ import httpx
 import pytest
 
 from marktplaats_ad_watcher.config import parse_dotenv, write_dotenv
-from marktplaats_ad_watcher.models import Ad, EvaluatedAd, EvaluationResult
+from marktplaats_ad_watcher.models import (
+    Ad,
+    EvaluatedAd,
+    EvaluationResult,
+    WatcherRunSummary,
+)
 from marktplaats_ad_watcher.state import SeenStore
+from marktplaats_ad_watcher.status import RuntimeStatus
 from marktplaats_ad_watcher.web import ERROR_RETRY_SECONDS, WatcherService, create_web_app
 
 
@@ -378,6 +385,158 @@ async def test_evaluations_page_filters_and_downloads_json(tmp_path: Path) -> No
     assert downloaded.status_code == 200
     assert downloaded.json()[0]["result"]["next_action"] == "notify"
     assert len(downloaded.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_dashboard_formats_last_summary_as_pipeline(tmp_path: Path) -> None:
+    env_file = tmp_path / "settings.env"
+    status_file = tmp_path / "status.json"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "STATUS_FILE": str(status_file),
+        },
+    )
+    status = RuntimeStatus(
+        last_finished_at=datetime.now(UTC),
+        last_summary=WatcherRunSummary(
+            fetched_count=17,
+            kept_count=12,
+            filtered_count=5,
+            new_count=3,
+            evaluated_count=3,
+            notified_count=1,
+            ignored_count=1,
+            review_count=1,
+            notify_action_count=1,
+        ),
+    )
+    status_file.write_text(status.model_dump_json(indent=2), encoding="utf-8")
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        page = await client.get("/?token=admin-token")
+
+    assert page.status_code == 200
+    assert "17</strong> fetched" in page.text
+    assert "12</strong> eligible" in page.text
+    assert "3</strong> evaluated" in page.text
+    assert "last_summary" not in page.text
+    assert "Pipeline tools" in page.text
+
+
+@pytest.mark.asyncio
+async def test_seen_ads_page_explains_and_filters_baseline_ads(tmp_path: Path) -> None:
+    env_file = tmp_path / "settings.env"
+    state_file = tmp_path / "seen_ads.json"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "STATE_FILE": str(state_file),
+        },
+    )
+    state_file.write_text(
+        """{
+  "seen_ads": {
+    "m1": {
+      "title": "Baseline freezer",
+      "url": "https://www.marktplaats.nl/v/m1",
+      "first_seen_at": "2026-08-14T00:00:00+00:00",
+      "bootstrapped": true
+    },
+    "m2": {
+      "title": "Processed freezer",
+      "url": "https://www.marktplaats.nl/v/m2",
+      "first_seen_at": "2026-08-14T01:00:00+00:00",
+      "evaluation": {"next_action": "notify", "confidence": 0.9}
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/seen")
+        baseline = await client.get("/seen?token=admin-token&kind=baseline")
+
+    assert denied.status_code == 401
+    assert baseline.status_code == 200
+    assert "Baseline freezer" in baseline.text
+    assert "Present when tracking started; skipped AI evaluation." in baseline.text
+    assert "Processed freezer" not in baseline.text
+
+
+@pytest.mark.asyncio
+async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    state_file = tmp_path / "seen_ads.json"
+    results_file = tmp_path / "evaluations.jsonl"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "STATE_FILE": str(state_file),
+            "RESULTS_FILE": str(results_file),
+        },
+    )
+    preview_ad = Ad(
+        id="m-preview",
+        title="Preview freezer",
+        url="https://www.marktplaats.nl/v/m-preview",
+        price="EUR 100.00",
+        location="Weert",
+    )
+
+    async def fake_fetch_preview(self: WatcherService) -> list[Ad]:
+        self._preview_ads = {preview_ad.id: preview_ad}
+        self._preview_fetched_at = datetime.now(UTC)
+        self._preview_counts = (2, 1, 1)
+        return [preview_ad]
+
+    async def fake_test_preview(self: WatcherService, ad_id: str) -> EvaluatedAd:
+        assert ad_id == preview_ad.id
+        return EvaluatedAd(
+            ad=preview_ad,
+            result=EvaluationResult(
+                relevant=True,
+                confidence=0.8,
+                reason="Promising dimensions.",
+                signals=["Chest freezer"],
+                next_action="review",
+            ),
+        )
+
+    monkeypatch.setattr(WatcherService, "fetch_preview", fake_fetch_preview)
+    monkeypatch.setattr(WatcherService, "test_preview_ad", fake_test_preview)
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/tools")
+        fetched = await client.post("/tools/fetch?token=admin-token")
+        tested = await client.post(
+            "/tools/test?token=admin-token",
+            data={"ad_id": preview_ad.id},
+        )
+
+    assert denied.status_code == 401
+    assert fetched.status_code == 200
+    assert "Preview freezer" in fetched.text
+    assert "2</strong> fetched" in fetched.text
+    assert tested.status_code == 200
+    assert "Test only" in tested.text
+    assert "Promising dimensions." in tested.text
+    assert not state_file.exists()
+    assert not results_file.exists()
 
 
 @pytest.mark.asyncio

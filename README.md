@@ -82,7 +82,13 @@ Run with the small web UI:
 ```
 
 Open `http://127.0.0.1:8080/?token=<WEB_ADMIN_TOKEN>` when `WEB_ADMIN_TOKEN` is set.
-The page shows last run time, returned result counts, Telegram trigger totals, ignored/review totals, and lets you edit the poll interval, prompt, model settings, and API keys. Existing API keys are never shown; leaving a secret field blank keeps the current value, except that changing providers clears the previous provider key.
+The dashboard shows formatted run status and activity totals. Protected pages provide evaluation
+history with decision filtering and JSON download, seen-ad history with baseline reasons, and
+pipeline tools for fetching current ads and testing one ad with AI without changing state or
+sending Telegram. A full production run remains a separate confirmed action. The configuration
+page edits the poll interval, prompt, model settings, and API keys. Existing API keys are never
+shown; leaving a secret field blank keeps the current value, except that changing providers clears
+the previous provider key.
 
 ## Model providers
 
