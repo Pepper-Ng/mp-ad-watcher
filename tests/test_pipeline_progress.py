@@ -57,6 +57,7 @@ def test_pipeline_progress_imports_production_evaluations(tmp_path: Path) -> Non
 
     records = PipelineProgressStore(progress_path).sync_evaluations(evaluations_path)
 
+    assert records is not None
     assert len(records) == 1
     assert records[0].source == "production"
     assert records[0].telegram_sent is None

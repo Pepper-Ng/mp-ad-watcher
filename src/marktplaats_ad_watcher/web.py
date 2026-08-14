@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +10,7 @@ import re
 from collections import deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -20,7 +23,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from marktplaats_ad_watcher.config import Settings, parse_dotenv, write_dotenv
-from marktplaats_ad_watcher.factory import build_watcher
+from marktplaats_ad_watcher.factory import build_profile_orchestrator
 from marktplaats_ad_watcher.marktplaats import MarktplaatsClient
 from marktplaats_ad_watcher.model_config import (
     PROVIDER_PRESETS,
@@ -34,6 +37,16 @@ from marktplaats_ad_watcher.pipeline_progress import (
     PipelineProgressRecord,
     PipelineProgressStore,
 )
+from marktplaats_ad_watcher.profiles import (
+    DEFAULT_PROFILE_ID,
+    ProfileConfigurationError,
+    ProfileRegistry,
+    ProfileRegistryStore,
+    SearchProfile,
+    ensure_profile_registry,
+    verify_profile_registry,
+)
+from marktplaats_ad_watcher.runner import ProfileExecutionSummary
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
 from marktplaats_ad_watcher.telegram import TelegramNotifier
@@ -145,6 +158,23 @@ def _redact_diagnostic_text(value: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ProfileSelection:
+    """The requested web scope, with ``all`` reserved for read-only aggregation."""
+
+    registry: ProfileRegistry | None
+    profile: SearchProfile | None
+    is_all: bool = False
+
+    @property
+    def label(self) -> str:
+        if self.is_all:
+            return "All searches"
+        if self.profile is not None:
+            return self.profile.name
+        return "Freezers"
+
+
 class WatcherService:
     def __init__(self, *, env_file: Path, dry_run: bool) -> None:
         self._env_file = env_file
@@ -157,6 +187,9 @@ class WatcherService:
         self._preview_ads: dict[str, Ad] = {}
         self._preview_fetched_at: datetime | None = None
         self._preview_counts = (0, 0, 0)
+        self._profile_preview_ads: dict[str, dict[str, Ad]] = {}
+        self._profile_preview_fetched_at: dict[str, datetime] = {}
+        self._profile_preview_counts: dict[str, tuple[int, int, int]] = {}
 
     @property
     def env_file(self) -> Path:
@@ -181,6 +214,67 @@ class WatcherService:
         status_file = Path(values.get("STATUS_FILE", "data/runtime_status.json"))
         return RuntimeStatusStore(status_file)
 
+    def activate_profile_registry(self) -> ProfileRegistry:
+        """Safely migrate once, then verify profile copies before profile-aware work starts."""
+
+        settings = self._load_settings()
+        result = ensure_profile_registry(settings)
+        verification = verify_profile_registry(settings)
+        if result.registry != verification.registry:
+            raise ProfileConfigurationError("Profile registry changed during verification.")
+        return verification.registry
+
+    def profile_selection(self, requested_profile_id: str | None) -> ProfileSelection:
+        """Resolve a safe profile scope while retaining an unconfigured legacy UI fallback."""
+
+        try:
+            registry = self.activate_profile_registry()
+        except ValueError as error:
+            if not str(error).startswith("Missing required environment variable MARKTPLAATS_"):
+                raise
+            if requested_profile_id and requested_profile_id not in {DEFAULT_PROFILE_ID, "freezers"}:
+                raise ValueError("Profiles are unavailable until search settings are configured.") from error
+            return ProfileSelection(registry=None, profile=None)
+
+        requested = (requested_profile_id or registry.default_profile_id).strip().lower()
+        if requested == "all":
+            return ProfileSelection(registry=registry, profile=None, is_all=True)
+        try:
+            profile = registry.profile(requested)
+        except ProfileConfigurationError as error:
+            raise ValueError(str(error)) from error
+        return ProfileSelection(registry=registry, profile=profile)
+
+    def profiles(self) -> tuple[SearchProfile, ...]:
+        """Return ordered active profiles, or no profiles for a not-yet-configured legacy UI."""
+
+        try:
+            return self.activate_profile_registry().active_profiles
+        except ValueError as error:
+            if str(error).startswith("Missing required environment variable MARKTPLAATS_"):
+                return ()
+            raise
+
+    def settings_for_profile(self, profile: SearchProfile | None) -> Settings:
+        try:
+            settings = self._load_settings()
+        except ValueError as error:
+            if profile is not None or not str(error).startswith(
+                "Missing required environment variable MARKTPLAATS_"
+            ):
+                raise
+            values = self.read_config()
+            values.setdefault(
+                "MARKTPLAATS_SEARCH_URL",
+                "https://www.marktplaats.nl/lrp/api/search?query=legacy",
+            )
+            values.setdefault("MARKTPLAATS_USE_CASE", "Legacy single-search settings.")
+            settings = Settings.from_environment(values, dry_run=self._dry_run)
+        return settings.for_profile(profile) if profile is not None else settings
+
+    def status_store_for(self, profile: SearchProfile | None) -> RuntimeStatusStore:
+        return RuntimeStatusStore(self.settings_for_profile(profile).status_file)
+
     def model_usage_store(self) -> ModelUsageStore:
         values = self.read_config()
         results_file = Path(values["RESULTS_FILE"])
@@ -200,9 +294,21 @@ class WatcherService:
         results_file = Path(values["RESULTS_FILE"])
         return PipelineProgressStore(results_file.parent / "pipeline_progress.json")
 
+    def pipeline_progress_store_for(self, profile: SearchProfile | None) -> PipelineProgressStore:
+        return PipelineProgressStore(self.settings_for_profile(profile).pipeline_progress_file)
+
     def pipeline_progress(self) -> list[PipelineProgressRecord]:
         values = self.read_config()
         return self.pipeline_progress_store().sync_evaluations(Path(values["RESULTS_FILE"]))
+
+    def pipeline_progress_for(self, profile: SearchProfile | None) -> list[PipelineProgressRecord]:
+        if profile is None:
+            return self.pipeline_progress()
+        settings = self.settings_for_profile(profile)
+        return _profile_progress_records(
+            self.pipeline_progress_store_for(profile).sync_evaluations(settings.results_file),
+            profile,
+        )
 
     @property
     def preview_ads(self) -> list[Ad]:
@@ -223,8 +329,33 @@ class WatcherService:
     def preview_counts(self) -> tuple[int, int, int]:
         return self._preview_counts
 
-    async def fetch_preview(self) -> list[Ad]:
-        settings = self._load_settings()
+    def preview_ads_for(self, profile: SearchProfile | None) -> list[Ad]:
+        profile_id = _preview_profile_id(profile)
+        if profile is None:
+            return self.preview_ads
+        fetched_at = self._profile_preview_fetched_at.get(profile_id)
+        if fetched_at is None and profile.id == DEFAULT_PROFILE_ID:
+            return self.preview_ads
+        if fetched_at is None or datetime.now(UTC) - fetched_at > timedelta(minutes=30):
+            self._profile_preview_ads.pop(profile_id, None)
+            self._profile_preview_fetched_at.pop(profile_id, None)
+            self._profile_preview_counts.pop(profile_id, None)
+            return []
+        return list(self._profile_preview_ads.get(profile_id, {}).values())
+
+    def preview_fetched_at_for(self, profile: SearchProfile | None) -> datetime | None:
+        if profile is None:
+            return self.preview_fetched_at
+        value = self._profile_preview_fetched_at.get(_preview_profile_id(profile))
+        return value if value is not None else self.preview_fetched_at
+
+    def preview_counts_for(self, profile: SearchProfile | None) -> tuple[int, int, int]:
+        if profile is None:
+            return self.preview_counts
+        return self._profile_preview_counts.get(_preview_profile_id(profile), self.preview_counts)
+
+    async def fetch_preview(self, profile: SearchProfile | None = None) -> list[Ad]:
+        settings = self.settings_for_profile(profile)
         client = MarktplaatsClient(
             timeout_seconds=settings.request_timeout_seconds,
             user_agent=settings.user_agent,
@@ -238,52 +369,77 @@ class WatcherService:
             for ad in fetched
             if not settings.exclude_admarkt_ads or not ad.id.lower().startswith("a")
         ]
-        self._preview_ads = {ad.id: ad for ad in eligible}
-        self._preview_fetched_at = datetime.now(UTC)
-        self._preview_counts = (len(fetched), len(eligible), len(fetched) - len(eligible))
+        profile_id = _preview_profile_id(profile)
+        fetched_at = datetime.now(UTC)
+        counts = (len(fetched), len(eligible), len(fetched) - len(eligible))
+        self._profile_preview_ads[profile_id] = {ad.id: ad for ad in eligible}
+        self._profile_preview_fetched_at[profile_id] = fetched_at
+        self._profile_preview_counts[profile_id] = counts
+        if profile is None or profile.id == DEFAULT_PROFILE_ID:
+            self._preview_ads = self._profile_preview_ads[profile_id]
+            self._preview_fetched_at = fetched_at
+            self._preview_counts = counts
         return eligible
 
-    async def test_preview_ad(self, ad_id: str) -> EvaluatedAd:
-        ads = {ad.id: ad for ad in self.preview_ads}
+    async def test_preview_ad(
+        self,
+        ad_id: str,
+        profile: SearchProfile | None = None,
+    ) -> EvaluatedAd:
+        ads = {ad.id: ad for ad in self.preview_ads_for(profile)}
         ad = ads.get(ad_id)
         if ad is None:
             raise ValueError("The preview expired or the selected ad is unavailable. Fetch again.")
-        settings = self._load_settings()
+        settings = self.settings_for_profile(profile)
         client = MarktplaatsClient(
             timeout_seconds=settings.request_timeout_seconds,
             user_agent=settings.user_agent,
         )
         enriched_ad = await client.enrich_ad(ad)
-        self._preview_ads[enriched_ad.id] = enriched_ad
+        profile_id = _preview_profile_id(profile)
+        self._profile_preview_ads.setdefault(profile_id, {})[enriched_ad.id] = enriched_ad
+        if profile is None or profile.id == DEFAULT_PROFILE_ID:
+            self._preview_ads[enriched_ad.id] = enriched_ad
         result = await build_model_evaluator(settings).evaluate(enriched_ad)
-        evaluated_ad = EvaluatedAd(ad=enriched_ad, result=result)
+        evaluated_ad = EvaluatedAd(
+            ad=enriched_ad,
+            result=result,
+            profile_id=settings.active_profile_id,
+            profile_name=settings.active_profile_name,
+        )
         seen_store = SeenStore(settings.state_file)
         seen_store.append_result(settings.results_file, evaluated_ad)
         seen_store.mark_seen(ad, result)
-        self.pipeline_progress_store().save_ai_result(evaluated_ad)
+        self.pipeline_progress_store_for(profile).save_ai_result(evaluated_ad)
         RuntimeStatusStore(settings.status_file).resolve_evaluation_failure(ad.id)
         return evaluated_ad
 
-    async def send_pipeline_result_to_telegram(self, ad_id: str) -> PipelineProgressRecord:
-        self.pipeline_progress()
-        record = self.pipeline_progress_store().get(ad_id)
+    async def send_pipeline_result_to_telegram(
+        self,
+        ad_id: str,
+        profile: SearchProfile | None = None,
+    ) -> PipelineProgressRecord:
+        self.pipeline_progress_for(profile)
+        progress_store = self.pipeline_progress_store_for(profile)
+        record = progress_store.get(ad_id)
         if record is None:
             raise ValueError("No saved AI result exists for this ad.")
-        send_result = await TelegramNotifier(self._load_settings()).send(record.evaluated_ad)
+        send_result = await TelegramNotifier(self.settings_for_profile(profile)).send(record.evaluated_ad)
         if not send_result.sent:
             raise ValueError(send_result.reason or "Telegram did not send the result.")
-        return self.pipeline_progress_store().mark_telegram_sent(
+        return progress_store.mark_telegram_sent(
             ad_id,
             message_id=send_result.message_id,
         )
 
-    async def send_standalone_telegram_test(self) -> None:
-        send_result = await TelegramNotifier(self._load_settings()).send_test_message()
+    async def send_standalone_telegram_test(self, profile: SearchProfile | None = None) -> None:
+        send_result = await TelegramNotifier(self.settings_for_profile(profile)).send_test_message()
         if not send_result.sent:
             raise ValueError(send_result.reason or "Telegram connectivity test failed.")
 
     async def start(self) -> None:
         self._stopping = False
+        self.activate_profile_registry()
         self._stop_event = asyncio.Event()
         self._loop_task = asyncio.create_task(self._run_forever())
 
@@ -296,19 +452,23 @@ class WatcherService:
         if self._manual_tasks:
             await asyncio.gather(*tuple(self._manual_tasks), return_exceptions=True)
 
-    async def run_once(self) -> None:
+    async def run_once(self) -> ProfileExecutionSummary:
         async with self._run_lock:
             try:
                 settings = self._load_settings()
-                watcher = build_watcher(
-                    settings,
-                    status_store=RuntimeStatusStore(settings.status_file),
-                )
+                execution = await build_profile_orchestrator(settings).run_all_enabled()
             except Exception as error:
                 self.status_store().mark_failed(error)
                 raise
 
-            await watcher.run_once()
+            LOGGER.info("Scheduled profile execution: %s", execution.model_dump())
+            return execution
+
+    async def run_profile_once(self, profile: SearchProfile) -> None:
+        async with self._run_lock:
+            settings = self._load_settings()
+            execution = await build_profile_orchestrator(settings).run_profile(profile.id)
+            LOGGER.info("Manual profile execution: %s", execution.model_dump())
 
     def queue_run_once(self) -> bool:
         if self._stopping or self._run_lock.locked() or self._manual_tasks:
@@ -319,26 +479,36 @@ class WatcherService:
         task.add_done_callback(self._manual_tasks.discard)
         return True
 
+    def queue_run_profile(self, profile: SearchProfile) -> bool:
+        if self._stopping or self._run_lock.locked() or self._manual_tasks:
+            return False
+
+        task = asyncio.create_task(self._run_profile_safely(profile))
+        self._manual_tasks.add(task)
+        task.add_done_callback(self._manual_tasks.discard)
+        return True
+
     async def _run_once_safely(self) -> None:
         with suppress(Exception):
             await self.run_once()
 
+    async def _run_profile_safely(self, profile: SearchProfile) -> None:
+        with suppress(Exception):
+            await self.run_profile_once(profile)
+
     async def _run_forever(self) -> None:
         assert self._stop_event is not None
         while not self._stop_event.is_set():
-            delay_seconds = ERROR_RETRY_SECONDS
+            delay_seconds: float = float(ERROR_RETRY_SECONDS)
             try:
-                await self.run_once()
-                settings = self._load_settings()
-                delay_seconds = settings.poll_interval_seconds
+                execution = await self.run_once()
+                delay_seconds = (
+                    self._next_profile_due_delay()
+                    if execution is not None
+                    else float(self._load_settings().poll_interval_seconds)
+                )
             except Exception:
                 LOGGER.exception("Watcher run failed; retrying in %s seconds.", delay_seconds)
-
-            next_run = datetime.now(UTC) + timedelta(seconds=delay_seconds)
-            try:
-                self.status_store().set_next_run_at(next_run)
-            except Exception:
-                LOGGER.exception("Could not update the next scheduled run time.")
 
             try:
                 await asyncio.wait_for(
@@ -350,6 +520,180 @@ class WatcherService:
 
     def _load_settings(self) -> Settings:
         return Settings.from_environment(self.read_config(), dry_run=self._dry_run)
+
+    def _next_profile_due_delay(self) -> float:
+        registry = self.activate_profile_registry()
+        scheduled = [
+            self.status_store_for(profile).read().next_run_at
+            for profile in registry.active_profiles
+            if profile.enabled
+        ]
+        due_times = [value for value in scheduled if value is not None]
+        if not due_times:
+            return float(self._load_settings().poll_interval_seconds)
+        return max(0.0, (min(due_times) - datetime.now(UTC)).total_seconds())
+
+
+def _preview_profile_id(profile: SearchProfile | None) -> str:
+    return profile.id if profile is not None else "__legacy__"
+
+
+def _select_profile(
+    request: Request,
+    service: WatcherService,
+    *,
+    require_concrete: bool = False,
+) -> ProfileSelection | HTMLResponse:
+    try:
+        selection = service.profile_selection(request.query_params.get("profile"))
+    except Exception as error:
+        return HTMLResponse(
+            _page("Invalid profile", _notice(_safe_error("Profile selection failed", error), error="")),
+            status_code=400,
+        )
+    if require_concrete and (
+        selection.is_all or (selection.profile is not None and selection.profile.archived)
+    ):
+        return HTMLResponse(
+            _page(
+                "Read-only aggregate view",
+                "<p class='alert'>This profile scope is read-only. Select one active profile before "
+                "running an action that changes state.</p>",
+            ),
+            status_code=400,
+        )
+    return selection
+
+
+def _status_for_selection(service: WatcherService, selection: ProfileSelection) -> RuntimeStatus:
+    if not selection.is_all:
+        return service.status_store_for(selection.profile).read()
+    registry = selection.registry
+    if registry is None:
+        return RuntimeStatus()
+
+    statuses = [
+        (profile, service.status_store_for(profile).read())
+        for profile in registry.active_profiles
+    ]
+    if not statuses:
+        return RuntimeStatus()
+
+    latest = max(
+        (status for _, status in statuses),
+        key=lambda status: status.last_finished_at or datetime.min.replace(tzinfo=UTC),
+    )
+    totals = {
+        field: sum(getattr(status, field) for _, status in statuses)
+        for field in (
+            "total_runs",
+            "total_errors",
+            "total_fetched",
+            "total_kept",
+            "total_filtered",
+            "total_new",
+            "total_evaluated",
+            "total_notified",
+            "total_ignored",
+            "total_reviewed",
+            "total_notify_actions",
+            "total_evaluation_failed",
+        )
+    }
+    errors = [
+        f"{profile.name}: {status.last_error}"
+        for profile, status in statuses
+        if status.last_error
+    ]
+    return RuntimeStatus(
+        is_running=any(status.is_running for _, status in statuses),
+        last_started_at=latest.last_started_at,
+        last_finished_at=latest.last_finished_at,
+        next_run_at=min(
+            (status.next_run_at for _, status in statuses if status.next_run_at is not None),
+            default=None,
+        ),
+        last_error=" · ".join(errors) if errors else None,
+        last_summary=latest.last_summary,
+        **totals,
+    )
+
+
+def _profiles_for_selection(selection: ProfileSelection) -> tuple[SearchProfile | None, ...]:
+    if selection.is_all:
+        return selection.registry.active_profiles if selection.registry is not None else ()
+    return (selection.profile,)
+
+
+def _diagnostic_entries(
+    entries: deque[dict[str, str]],
+    selection: ProfileSelection,
+) -> list[dict[str, str]]:
+    if selection.is_all or selection.profile is None:
+        return list(entries)
+    identifiers = (selection.profile.id.lower(), selection.profile.name.lower())
+    return [
+        entry
+        for entry in entries
+        if any(
+            identifier in f"{entry['message']} {entry['detail']}".lower()
+            for identifier in identifiers
+        )
+    ]
+
+
+def _read_scoped_evaluations(
+    service: WatcherService,
+    selection: ProfileSelection,
+    *,
+    action: str,
+) -> list[EvaluatedAd]:
+    evaluations: list[EvaluatedAd] = []
+    for profile in _profiles_for_selection(selection):
+        settings = service.settings_for_profile(profile)
+        for evaluation in _read_evaluations(settings.results_file, action=action):
+            if profile is not None and (
+                evaluation.profile_id != profile.id or evaluation.profile_name != profile.name
+            ):
+                evaluation = evaluation.model_copy(
+                    update={"profile_id": profile.id, "profile_name": profile.name}
+                )
+            evaluations.append(evaluation)
+    return sorted(evaluations, key=lambda evaluation: evaluation.evaluated_at, reverse=True)
+
+
+def _read_scoped_seen_ads(
+    service: WatcherService,
+    selection: ProfileSelection,
+    *,
+    kind: str,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for profile in _profiles_for_selection(selection):
+        settings = service.settings_for_profile(profile)
+        for entry in _read_seen_ads(settings.state_file, kind=kind):
+            if profile is not None:
+                entry = {**entry, "profile_id": profile.id, "profile_name": profile.name}
+            entries.append(entry)
+    return sorted(entries, key=lambda entry: str(entry.get("first_seen_at", "")), reverse=True)
+
+
+def _profile_progress_records(
+    records: list[PipelineProgressRecord],
+    profile: SearchProfile | None,
+) -> list[PipelineProgressRecord]:
+    if profile is None:
+        return records
+    return [
+        record.model_copy(
+            update={
+                "evaluated_ad": record.evaluated_ad.model_copy(
+                    update={"profile_id": profile.id, "profile_name": profile.name}
+                )
+            }
+        )
+        for record in records
+    ]
 
 
 def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
@@ -372,10 +716,14 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return denied
 
-        status = service.status_store().read()
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        status = _status_for_selection(service, selection)
         body = f"""
-                {_navigation(request, current="dashboard")}
+                {_navigation(request, current="dashboard", selection=selection)}
         {_warning_for_missing_token(service)}
+                {_profile_scope_heading(selection)}
                 {_status_panel(status)}
                 {_last_run_panel(status)}
         {_model_usage_panel(service.model_usage(), request)}
@@ -409,14 +757,37 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                     <a href="/api/status{_token_query(request)}">Status JSON</a>
                 </p>
         """
-        return HTMLResponse(_page("Marktplaats watcher", body))
+        profile_statuses = _profile_statuses_panel(service, selection)
+        return HTMLResponse(_page("Marktplaats watcher", body + profile_statuses))
 
     async def status_json(request: Request) -> JSONResponse | PlainTextResponse:
         denied = _deny_if_needed(request, service)
         if denied:
             return PlainTextResponse("Unauthorized", status_code=401)
 
-        return JSONResponse(service.status_store().read().model_dump(mode="json"))
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return PlainTextResponse("Invalid profile", status_code=400)
+        if not selection.is_all:
+            return JSONResponse(_status_for_selection(service, selection).model_dump(mode="json"))
+        registry = selection.registry
+        if registry is None:
+            return PlainTextResponse("Invalid profile", status_code=400)
+        active_profiles = registry.active_profiles
+
+        return JSONResponse(
+            {
+                "profiles": [
+                    {
+                        "profile_id": profile.id,
+                        "profile_name": profile.name,
+                        "status": service.status_store_for(profile).read().model_dump(mode="json"),
+                    }
+                    for profile in active_profiles
+                ],
+                "aggregate": _status_for_selection(service, selection).model_dump(mode="json"),
+            }
+        )
 
     async def health(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
@@ -426,13 +797,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return denied
 
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         action = _evaluation_action(request)
-        values = service.read_config()
-        evaluations = _read_evaluations(Path(values["RESULTS_FILE"]), action=action)
-        token_query = _token_query(request)
+        evaluations = _read_scoped_evaluations(service, selection, action=action)
         action_query = _query_with_token(request, action=action)
+        filename = _evaluations_download_name(selection)
         body = f"""
-        {_navigation(request, current="evaluations")}
+        {_navigation(request, current="evaluations", selection=selection)}
+        {_profile_scope_heading(selection)}
         <section class="panel">
           <form class="filter-form" method="get" action="/evaluations">
             {_token_hidden_input(request)}
@@ -444,11 +818,11 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             <button type="submit">Filter</button>
           </form>
           <p>{len(evaluations)} evaluation(s). Newest first.</p>
-          <p><a href="/api/evaluations{action_query}" download="evaluations.json">Download JSON</a>
+          <p><a href="/api/evaluations{action_query}" download="{escape(filename)}">Download JSON</a>
           </p>
           {_evaluation_cards(evaluations)}
         </section>
-        <p><a href="/{token_query}">Back to status</a></p>
+        <p><a href="/{_token_query(request)}">Back to status</a></p>
         """
         return HTMLResponse(_page("Evaluations", body))
 
@@ -457,22 +831,34 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return PlainTextResponse("Unauthorized", status_code=401)
 
-        values = service.read_config()
-        evaluations = _read_evaluations(
-            Path(values["RESULTS_FILE"]), action=_evaluation_action(request)
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return PlainTextResponse("Invalid profile", status_code=400)
+        evaluations = _read_scoped_evaluations(
+            service, selection, action=_evaluation_action(request)
         )
-        return JSONResponse([evaluation.model_dump(mode="json") for evaluation in evaluations])
+        return JSONResponse(
+            [evaluation.model_dump(mode="json") for evaluation in evaluations],
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{_evaluations_download_name(selection)}"'
+                )
+            },
+        )
 
     async def seen_ads(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
 
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         selected_kind = _seen_filter(request)
-        values = service.read_config()
-        entries = _read_seen_ads(Path(values["STATE_FILE"]), kind=selected_kind)
+        entries = _read_scoped_seen_ads(service, selection, kind=selected_kind)
         body = f"""
-        {_navigation(request, current="seen")}
+        {_navigation(request, current="seen", selection=selection)}
+        {_profile_scope_heading(selection)}
         <section class="panel">
           <form class="filter-form" method="get" action="/seen">
             {_token_hidden_input(request)}
@@ -485,21 +871,48 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           intentionally skipped AI evaluation.</p>
           <p class="hint">A currently new ad appears here only after its production AI evaluation
           succeeds. Failed ads remain pending, stay off this page, and retry on later runs.</p>
-          {_seen_ads_table(entries)}
+          {_seen_ads_table(entries, show_profile=selection.is_all or selection.profile is not None)}
         </section>
         """
         return HTMLResponse(_page("Seen ads", body))
 
     def tools_page(
         request: Request,
+        selection: ProfileSelection,
         *,
         notice: str | None = None,
         error: str | None = None,
     ) -> HTMLResponse:
-        values = service.read_config()
-        seen = _read_seen_ads(Path(values["STATE_FILE"]), kind="all")
+        if selection.is_all:
+            registry = selection.registry
+            if registry is None:
+                return HTMLResponse(
+                    _page("Profiles unavailable", "<p class='alert'>No profile registry is active.</p>"),
+                    status_code=400,
+                )
+            records: list[PipelineProgressRecord] = []
+            for profile in registry.active_profiles:
+                for record in service.pipeline_progress_for(profile):
+                    evaluated = record.evaluated_ad.model_copy(
+                        update={"profile_id": profile.id, "profile_name": profile.name}
+                    )
+                    records.append(record.model_copy(update={"evaluated_ad": evaluated}))
+            body = f"""
+            {_navigation(request, current="tools", selection=selection)}
+            {_profile_scope_heading(selection)}
+            <section class="panel">
+              <h2>Aggregate pipeline history</h2>
+              <p>All searches is read-only. Select one profile to fetch ads, test AI, send a
+              saved result, or start a production run.</p>
+              {_pipeline_progress_cards(request, records, read_only=True)}
+            </section>
+            """
+            return HTMLResponse(_page("Pipeline tools", body))
+
+        settings = service.settings_for_profile(selection.profile)
+        seen = _read_seen_ads(settings.state_file, kind="all")
         seen_by_id = {str(entry["id"]): entry for entry in seen}
-        runtime_status = service.status_store().read()
+        runtime_status = service.status_store_for(selection.profile).read()
         summary = runtime_status.last_summary
         attempt_time = _format_time_text(runtime_status.last_finished_at)
         failures_by_id = (
@@ -510,9 +923,13 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             if summary
             else {}
         )
-        progress = service.pipeline_progress()
+        progress = _profile_progress_records(
+            service.pipeline_progress_for(selection.profile),
+            selection.profile,
+        )
         body = f"""
-        {_navigation(request, current="tools")}
+        {_navigation(request, current="tools", selection=selection)}
+        {_profile_scope_heading(selection)}
         {_notice(notice, error=error)}
         {_model_usage_panel(service.model_usage(), request, compact=True)}
         <section class="panel">
@@ -521,8 +938,13 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           <form method="post" action="/tools/fetch{_token_query(request)}">
             <button type="submit">Fetch current ads</button>
           </form>
-          {_preview_summary(service)}
-          {_preview_ads_form(request, service.preview_ads, seen_by_id, failures_by_id)}
+          {_preview_summary(service, selection.profile)}
+          {_preview_ads_form(
+              request,
+              service.preview_ads_for(selection.profile),
+              seen_by_id,
+              failures_by_id,
+          )}
         </section>
         <section class="panel">
           <h2>Phase 2 · AI test</h2>
@@ -559,33 +981,50 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         notice = request.query_params.get("notice")
-        return tools_page(request, notice=notice)
+        return tools_page(request, selection, notice=notice)
 
     async def tools_fetch(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         try:
-            await service.fetch_preview()
+            if selection.profile is not None and request.query_params.get("profile"):
+                await service.fetch_preview(selection.profile)
+            else:
+                await service.fetch_preview()
         except Exception as error:
             LOGGER.exception("Pipeline fetch preview failed.")
-            return tools_page(request, error=_safe_error("Fetch failed", error))
-        return tools_page(request, notice="Fetched current ads without changing watcher state.")
+            return tools_page(request, selection, error=_safe_error("Fetch failed", error))
+        return tools_page(
+            request,
+            selection,
+            notice="Fetched current ads without changing watcher state.",
+        )
 
     async def tools_test(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         ad_id = form.get("ad_id", [""])[0].strip()
         try:
-            result = await service.test_preview_ad(ad_id)
+            result = await service.test_preview_ad(ad_id, selection.profile)
         except Exception as error:
             LOGGER.exception("Pipeline AI preview failed.")
-            return tools_page(request, error=_safe_error("AI test failed", error))
+            return tools_page(request, selection, error=_safe_error("AI test failed", error))
         return tools_page(
             request,
+            selection,
             notice=(
                 f"AI phase completed for {result.ad.title}. The result was saved and the ad is "
                 "now processed. Telegram was not called."
@@ -596,15 +1035,19 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         ad_id = form.get("ad_id", [""])[0].strip()
         try:
-            record = await service.send_pipeline_result_to_telegram(ad_id)
+            record = await service.send_pipeline_result_to_telegram(ad_id, selection.profile)
         except Exception as error:
             LOGGER.exception("Pipeline Telegram result test failed.")
-            return tools_page(request, error=_safe_error("Telegram test failed", error))
+            return tools_page(request, selection, error=_safe_error("Telegram test failed", error))
         return tools_page(
             request,
+            selection,
             notice=f"Telegram sent for {record.evaluated_ad.ad.title} and delivery was recorded.",
         )
 
@@ -612,19 +1055,30 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         try:
-            await service.send_standalone_telegram_test()
+            await service.send_standalone_telegram_test(selection.profile)
         except Exception as error:
             LOGGER.exception("Standalone Telegram test failed.")
-            return tools_page(request, error=_safe_error("Telegram test failed", error))
-        return tools_page(request, notice="Standalone Telegram test message sent successfully.")
+            return tools_page(request, selection, error=_safe_error("Telegram test failed", error))
+        return tools_page(
+            request,
+            selection,
+            notice="Standalone Telegram test message sent successfully.",
+        )
 
     async def full_run_confirm(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         body = f"""
-        {_navigation(request, current="tools")}
+        {_navigation(request, current="tools", selection=selection)}
+        {_profile_scope_heading(selection)}
         <section class="panel full-run-panel">
           <h2>Confirm full production run</h2>
           <p>This action writes seen/evaluation state and may send Telegram for new ads.</p>
@@ -640,13 +1094,18 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         body = f"""
-        {_navigation(request, current="diagnostics")}
+        {_navigation(request, current="diagnostics", selection=selection)}
+        {_profile_scope_heading(selection)}
         <section class="panel">
           <h2>Recent watcher logs</h2>
-          <p>Shows the latest in-process messages since this container started. For complete Docker
-          output, open Portainer → Containers → marktplaats-ad-watcher → Logs.</p>
-          {_recent_logs_table(list(recent_logs.entries))}
+                    <p>Shows the latest in-process messages since this container started. A concrete profile
+                    only shows entries that identify that profile; all searches shows the aggregate. For
+                    complete Docker output, open Portainer → Containers → marktplaats-ad-watcher → Logs.</p>
+                    {_recent_logs_table(_diagnostic_entries(recent_logs.entries, selection))}
         </section>
         """
         return HTMLResponse(_page("Diagnostics", body))
@@ -655,27 +1114,37 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         usage = service.model_usage()
         notice = request.query_params.get("notice")
+        controls = (
+            "<section class='panel'><p>All searches is read-only. Select one profile to change "
+            "the shared model budget.</p></section>"
+            if selection.is_all
+            else f"""
+            <section class="panel">
+              <h2>Change daily limit</h2>
+              <p>All production and manual AI calls share this UTC-daily budget. Only successful
+              provider responses count as used; failed HTTP/network calls release their reservation.</p>
+              <form class="model-limit-form" method="post"
+                  action="/model-usage/limit{_token_query(request)}">
+                <label>Requests per UTC day
+                  <input type="number" name="limit" min="1" max="1000" value="{usage.limit}">
+                </label>
+                <button type="submit">Review limit change</button>
+              </form>
+              <p><a href="/model-usage/reset{_token_query(request)}">Reset today's usage…</a></p>
+            </section>
+            """
+        )
         body = f"""
-        {_navigation(request, current="usage")}
+        {_navigation(request, current="usage", selection=selection)}
+        {_profile_scope_heading(selection)}
         {_notice(notice)}
         {_model_usage_panel(usage, request, compact=True)}
-        <section class="panel">
-          <h2>Change daily limit</h2>
-          <p>All production and manual AI calls share this UTC-daily budget. Only successful
-          provider responses count as used; failed HTTP/network calls release their reservation.</p>
-                    <form class="model-limit-form" method="post"
-                        action="/model-usage/limit{_token_query(request)}">
-            <label>Requests per UTC day
-              <input type="number" name="limit" min="1" max="1000" value="{usage.limit}">
-            </label>
-            <button type="submit">Review limit change</button>
-          </form>
-                    <p><a href="/model-usage/reset{_token_query(request)}">
-                        Reset today's usage…
-                    </a></p>
-        </section>
+        {controls}
         """
         return HTMLResponse(_page("Model request budget", body))
 
@@ -683,6 +1152,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         try:
             new_limit = int(form.get("limit", [""])[0])
@@ -702,7 +1174,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 status_code=303,
             )
         body = f"""
-        {_navigation(request, current="usage")}
+        {_navigation(request, current="usage", selection=selection)}
         <section class="panel full-run-panel">
           <h2>Confirm increased model budget</h2>
           <p>Increase the daily limit from <strong>{current.limit}</strong> to
@@ -721,6 +1193,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         try:
             new_limit = int(form.get("limit", [""])[0])
@@ -743,9 +1218,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         usage = service.model_usage()
         body = f"""
-        {_navigation(request, current="usage")}
+        {_navigation(request, current="usage", selection=selection)}
         <section class="panel full-run-panel">
           <h2>Reset today's model usage?</h2>
           <p>This changes usage from <strong>{usage.used}</strong> to <strong>0</strong> and
@@ -762,6 +1240,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         denied = _deny_if_needed(request, service)
         if denied:
             return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         updated = service.reset_model_usage_today()
         notice = f"Today's model usage was reset to {updated.used}/{updated.limit}."
         return RedirectResponse(
@@ -774,7 +1255,18 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return denied
 
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
         values = service.read_config()
+        if selection.is_all:
+            body = f"""
+            {_navigation(request, current="config", selection=selection)}
+            {_profile_scope_heading(selection)}
+            <section class="panel"><p>All searches is read-only. Select one profile to edit the
+            shared global configuration.</p></section>
+            """
+            return HTMLResponse(_page("Watcher configuration", body))
         token_query = _token_query(request)
         notify_review_checkbox = _checkbox(
             "NOTIFY_REVIEW_ACTIONS", values, "Send reviews to Telegram"
@@ -785,15 +1277,13 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         disable_previews_checkbox = _checkbox(
             "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", values, "Disable previews"
         )
+        profile_settings = _profile_settings_config_panel(request, values, selection)
         body = f"""
-        {_navigation(request, current="config")}
+        {_navigation(request, current="config", selection=selection)}
+        {_profile_scope_heading(selection)}
         {_warning_for_missing_token(service)}
                 <form class="config-form" method="post" action="/config{token_query}">
-                    <fieldset>
-                        <legend>Watch criteria</legend>
-                        {_input("MARKTPLAATS_SEARCH_URL", values, label="Marktplaats search URL")}
-                        {_textarea("MARKTPLAATS_USE_CASE", values, label="Evaluation instructions")}
-                    </fieldset>
+                    {profile_settings}
 
                     <fieldset>
                         <legend>Schedule and filtering</legend>
@@ -887,6 +1377,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return denied
 
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         current = service.read_config()
         file_values = parse_dotenv(service.env_file)
@@ -912,7 +1405,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 status_code=400,
             )
         updated: dict[str, str] = {}
-        for key in EDITABLE_KEYS:
+        editable_keys = (
+            [
+                key
+                for key in EDITABLE_KEYS
+                if key not in {"MARKTPLAATS_SEARCH_URL", "MARKTPLAATS_USE_CASE"}
+            ]
+            if selection.registry is not None
+            else EDITABLE_KEYS
+        )
+        for key in editable_keys:
             if key in BOOLEAN_KEYS:
                 updated[key] = "true" if key in form else "false"
                 continue
@@ -949,7 +1451,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         ):
             updated["MODEL_TEMPERATURE"] = "0"
 
-        write_dotenv(service.env_file, updated)
+        persisted = {
+            key: value
+            for key, value in file_values.items()
+            if key not in LEGACY_MODEL_KEYS
+        }
+        write_dotenv(service.env_file, {**persisted, **updated})
         return RedirectResponse(f"/{_token_query(request)}", status_code=303)
 
     async def run_now(request: Request) -> RedirectResponse | HTMLResponse:
@@ -957,10 +1464,188 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if denied:
             return denied
 
-        queued = service.queue_run_once()
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        queued = (
+            service.queue_run_profile(selection.profile)
+            if selection.profile is not None
+            else service.queue_run_once()
+        )
         message = "Full run queued." if queued else "A run is already in progress."
         return RedirectResponse(
             f"/tools{_query_with_values(request, notice=message)}",
+            status_code=303,
+        )
+
+    async def profiles_get(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        if selection.registry is None:
+            return HTMLResponse(
+                _page(
+                    "Profiles unavailable",
+                    "<p class='alert'>Configure a Marktplaats search URL and evaluation instructions "
+                    "before creating profiles.</p>",
+                ),
+                status_code=400,
+            )
+        create_panel = ""
+        if not selection.is_all:
+            create_panel = f"""
+            <section class="panel">
+              <h2>Create profile</h2>
+              {_profile_form(request, action="/profiles/create", profile=None)}
+            </section>
+            """
+        body = f"""
+        {_navigation(request, current="profiles", selection=selection)}
+        <section class="panel">
+          <h2>Saved searches</h2>
+          <p>Profile IDs are storage keys: they are immutable after creation. Archiving keeps all
+          seen ads, evaluations, status, and pipeline history; it never deletes data.</p>
+          {_profiles_table(request, selection.registry, show_actions=not selection.is_all)}
+        </section>
+        {create_panel}
+        """
+        return HTMLResponse(_page("Profile management", body))
+
+    async def profile_edit_get(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        try:
+            registry = service.activate_profile_registry()
+            profile = registry.profile(request.path_params["profile_id"])
+        except (ProfileConfigurationError, ValueError) as error:
+            return HTMLResponse(_page("Invalid profile", _notice(str(error), error="")), status_code=400)
+        if profile.archived:
+            return HTMLResponse(
+                _page("Archived profile", "<p class='alert'>Archived profiles cannot be edited.</p>"),
+                status_code=400,
+            )
+        body = f"""
+        {_navigation(request, current="profiles", selection=selection)}
+        <section class="panel">
+          <h2>Edit {escape(profile.name)}</h2>
+          <p class="hint">ID: {escape(profile.id)} (immutable)</p>
+          {_profile_form(request, action=f"/profiles/{profile.id}/edit", profile=profile)}
+        </section>
+        """
+        return HTMLResponse(_page("Edit profile", body))
+
+    async def profile_edit_post(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        try:
+            settings = service._load_settings()
+            store = ProfileRegistryStore(settings.data_root)
+            current = store.load().profile(request.path_params["profile_id"])
+            if current.archived:
+                raise ProfileConfigurationError("Archived profiles cannot be edited.")
+            updated = SearchProfile(
+                id=current.id,
+                name=_profile_form_value(form, "name"),
+                search_url=_profile_form_value(form, "search_url"),
+                use_case=_profile_form_value(form, "use_case"),
+                enabled="enabled" in form,
+                sort_order=current.sort_order,
+                bootstrap_existing_ads=current.bootstrap_existing_ads,
+                poll_interval_seconds=_profile_interval(form),
+                archived=False,
+            )
+            store.update(updated)
+        except (ProfileConfigurationError, ValueError) as error:
+            return HTMLResponse(
+                _page("Invalid profile", f"<p class='alert'>{escape(str(error))}</p>"),
+                status_code=400,
+            )
+        return RedirectResponse(
+            f"/profiles{_query_with_values(request, notice='Profile updated.')}", status_code=303
+        )
+
+    async def profile_create(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        try:
+            settings = service._load_settings()
+            store = ProfileRegistryStore(settings.data_root)
+            profile = SearchProfile(
+                id=_profile_form_value(form, "id"),
+                name=_profile_form_value(form, "name"),
+                search_url=_profile_form_value(form, "search_url"),
+                use_case=_profile_form_value(form, "use_case"),
+                enabled="enabled" in form,
+                sort_order=store.next_sort_order(),
+                bootstrap_existing_ads=False,
+                poll_interval_seconds=_profile_interval(form),
+            )
+            store.create(profile)
+        except (ProfileConfigurationError, ValueError) as error:
+            return HTMLResponse(
+                _page("Invalid profile", f"<p class='alert'>{escape(str(error))}</p>"),
+                status_code=400,
+            )
+        return RedirectResponse(
+            f"/profiles{_query_with_values(request, notice='Profile created.')}", status_code=303
+        )
+
+    async def profile_toggle(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        try:
+            settings = service._load_settings()
+            store = ProfileRegistryStore(settings.data_root)
+            profile = store.load().profile(request.path_params["profile_id"])
+            store.set_enabled(profile.id, enabled=not profile.enabled)
+            message = "Profile enabled." if not profile.enabled else "Profile paused."
+        except (ProfileConfigurationError, ValueError) as error:
+            return HTMLResponse(
+                _page("Invalid profile", f"<p class='alert'>{escape(str(error))}</p>"),
+                status_code=400,
+            )
+        return RedirectResponse(
+            f"/profiles{_query_with_values(request, notice=message)}", status_code=303
+        )
+
+    async def profile_archive(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        try:
+            settings = service._load_settings()
+            ProfileRegistryStore(settings.data_root).archive(request.path_params["profile_id"])
+        except (ProfileConfigurationError, ValueError) as error:
+            return HTMLResponse(
+                _page("Invalid profile", f"<p class='alert'>{escape(str(error))}</p>"),
+                status_code=400,
+            )
+        return RedirectResponse(
+            f"/profiles{_query_with_values(request, notice='Profile archived; history was retained.')}",
             status_code=303,
         )
 
@@ -986,6 +1671,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/model-usage/reset/apply", model_usage_reset_apply, methods=["POST"]),
             Route("/config", config_get, methods=["GET"]),
             Route("/config", config_post, methods=["POST"]),
+            Route("/profiles", profiles_get),
+            Route("/profiles/create", profile_create, methods=["POST"]),
+            Route("/profiles/{profile_id}/edit", profile_edit_get, methods=["GET"]),
+            Route("/profiles/{profile_id}/edit", profile_edit_post, methods=["POST"]),
+            Route("/profiles/{profile_id}/toggle", profile_toggle, methods=["POST"]),
+            Route("/profiles/{profile_id}/archive", profile_archive, methods=["POST"]),
             Route("/run-now", run_now, methods=["POST"]),
         ],
         lifespan=lifespan,
@@ -1009,14 +1700,23 @@ def _deny_if_needed(request: Request, service: WatcherService) -> HTMLResponse |
 
 
 def _token_query(request: Request) -> str:
+    values: dict[str, str] = {}
     token = request.query_params.get("token")
-    return f"?{urlencode({'token': token})}" if token else ""
+    profile = request.query_params.get("profile")
+    if token:
+        values["token"] = token
+    if profile:
+        values["profile"] = profile
+    return f"?{urlencode(values)}" if values else ""
 
 
 def _query_with_values(request: Request, **values: str) -> str:
     token = request.query_params.get("token")
+    profile = request.query_params.get("profile")
     if token:
         values["token"] = token
+    if profile and "profile" not in values:
+        values["profile"] = profile
     return f"?{urlencode(values)}" if values else ""
 
 
@@ -1024,7 +1724,15 @@ def _query_with_token(request: Request, *, action: str) -> str:
     return _query_with_values(request, action=action)
 
 
-def _navigation(request: Request, *, current: str) -> str:
+def _profile_query(request: Request, profile_id: str) -> str:
+    values = {"profile": profile_id}
+    token = request.query_params.get("token")
+    if token:
+        values["token"] = token
+    return f"?{urlencode(values)}"
+
+
+def _navigation(request: Request, *, current: str, selection: ProfileSelection) -> str:
     token_query = _token_query(request)
     items = [
         ("dashboard", "/", "Dashboard"),
@@ -1034,12 +1742,208 @@ def _navigation(request: Request, *, current: str) -> str:
         ("usage", "/model-usage", "Model budget"),
         ("diagnostics", "/diagnostics", "Diagnostics"),
         ("config", "/config", "Configuration"),
+        ("profiles", "/profiles", "Profiles"),
     ]
     links = []
     for key, path, label in items:
         active = ' class="active" aria-current="page"' if key == current else ""
         links.append(f'<a{active} href="{path}{token_query}">{label}</a>')
-    return f"<nav class='main-nav' aria-label='Main navigation'>{''.join(links)}</nav>"
+    return (
+        f"<nav class='main-nav' aria-label='Main navigation'>{''.join(links)}</nav>"
+        f"{_profile_selector(request, selection)}"
+    )
+
+
+def _profile_selector(request: Request, selection: ProfileSelection) -> str:
+    if selection.registry is None:
+        return ""
+    selected_id = "all" if selection.is_all else (
+        selection.profile.id if selection.profile is not None else DEFAULT_PROFILE_ID
+    )
+    options = []
+    for profile in selection.registry.active_profiles:
+        paused = " · paused" if not profile.enabled else ""
+        selected = " selected" if profile.id == selected_id else ""
+        options.append(
+            f"<option value='{escape(profile.id)}'{selected}>{escape(profile.name + paused)}</option>"
+        )
+    options.append(
+        "<option value='all'"
+        f"{' selected' if selected_id == 'all' else ''}>All searches (read-only)</option>"
+    )
+    token = request.query_params.get("token")
+    token_input = f"<input type='hidden' name='token' value='{escape(token)}'>" if token else ""
+    return f"""
+    <form class="profile-selector" method="get" action="{escape(request.url.path)}">
+      {token_input}
+      <label>Search profile
+        <select name="profile" onchange="this.form.submit()">{''.join(options)}</select>
+      </label>
+      <button type="submit">Switch</button>
+    </form>
+    """
+
+
+def _profile_scope_heading(selection: ProfileSelection) -> str:
+    if selection.is_all:
+        return "<p class='profile-scope'><strong>Scope:</strong> All searches · read-only aggregate</p>"
+    if selection.profile is None:
+        return ""
+    paused = " · archived (read-only)" if selection.profile.archived else ""
+    if not paused and not selection.profile.enabled:
+        paused = " · paused"
+    return (
+        "<p class='profile-scope'><strong>Scope:</strong> "
+        f"{escape(selection.profile.name)} · {escape(selection.profile.id)}{paused}</p>"
+    )
+
+
+def _profile_statuses_panel(service: WatcherService, selection: ProfileSelection) -> str:
+    if not selection.is_all or selection.registry is None:
+        return ""
+    rows = []
+    for profile in selection.registry.active_profiles:
+        status = service.status_store_for(profile).read()
+        state = "Paused" if not profile.enabled else "Enabled"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(profile.name)} <span class='secondary'>{escape(profile.id)}</span></td>"
+            f"<td>{escape(state)}</td><td>{_format_time(status.last_finished_at)}</td>"
+            f"<td>{status.total_evaluated}</td><td>{status.total_errors}</td>"
+            "</tr>"
+        )
+    return f"""
+    <section class="panel">
+      <h2>Search status by profile</h2>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Profile</th><th>Schedule</th><th>Last completed</th>
+        <th>Evaluated</th><th>Errors</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table></div>
+    </section>
+    """
+
+
+def _evaluations_download_name(selection: ProfileSelection) -> str:
+    if selection.is_all:
+        return "evaluations-all.json"
+    if selection.profile is None:
+        return "evaluations.json"
+    return f"evaluations-{selection.profile.id}.json"
+
+
+def _profile_settings_config_panel(
+    request: Request,
+    values: Mapping[str, str],
+    selection: ProfileSelection,
+) -> str:
+    if selection.registry is None:
+        return f"""
+        <fieldset>
+          <legend>Watch criteria</legend>
+          {_input("MARKTPLAATS_SEARCH_URL", values, label="Marktplaats search URL")}
+          {_textarea("MARKTPLAATS_USE_CASE", values, label="Evaluation instructions")}
+        </fieldset>
+        """
+    return f"""
+    <fieldset>
+      <legend>Search profiles</legend>
+      <p>Search URL and evaluation instructions are profile-specific. Manage them from
+    <a href="/profiles{_token_query(request)}">Profile management</a>.
+      Saving this global configuration never overwrites an active profile.</p>
+      <details>
+        <summary>Legacy single-search settings (read-only)</summary>
+        <p><strong>URL:</strong> {escape(values.get("MARKTPLAATS_SEARCH_URL", ""))}</p>
+        <p><strong>Instructions:</strong> {escape(values.get("MARKTPLAATS_USE_CASE", ""))}</p>
+      </details>
+    </fieldset>
+    """
+def _profiles_table(
+    request: Request,
+    registry: ProfileRegistry,
+    *,
+    show_actions: bool = True,
+) -> str:
+    rows = []
+    for profile in sorted(registry.profiles, key=lambda item: item.sort_order):
+        state = "Archived" if profile.archived else ("Enabled" if profile.enabled else "Paused")
+        interval = str(profile.poll_interval_seconds) if profile.poll_interval_seconds else "Global"
+        if not show_actions or profile.archived:
+            actions = "—"
+            if profile.archived:
+                actions = (
+                    f"<a href='/evaluations{_profile_query(request, profile.id)}'>View history</a> "
+                    "<span class='secondary'>History retained</span>"
+                )
+        else:
+            toggle_label = "Pause" if profile.enabled else "Enable"
+            actions = (
+                f"<a href='/profiles/{escape(profile.id)}/edit{_token_query(request)}'>Edit</a> "
+                f"<form class='inline-form' method='post' "
+                f"action='/profiles/{escape(profile.id)}/toggle{_token_query(request)}'>"
+                f"<button type='submit'>{toggle_label}</button></form>"
+            )
+            if profile.id != registry.default_profile_id:
+                actions += (
+                    f" <form class='inline-form' method='post' "
+                    f"action='/profiles/{escape(profile.id)}/archive{_token_query(request)}'>"
+                    "<button class='warning-button' type='submit'>Archive</button></form>"
+                )
+        rows.append(
+            f"""
+            <tr><td>{escape(profile.name)}<span class="secondary">{escape(profile.id)}</span></td>
+              <td>{escape(state)}</td><td>{escape(interval)}</td>
+              <td>{actions}</td></tr>
+            """
+        )
+    return f"""
+    <div class="table-scroll"><table>
+      <thead><tr><th>Profile</th><th>State</th><th>Interval (seconds)</th><th>Actions</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table></div>
+    """
+
+
+def _profile_form(request: Request, *, action: str, profile: SearchProfile | None) -> str:
+    values = {
+        "id": profile.id if profile is not None else "",
+        "name": profile.name if profile is not None else "",
+        "search_url": profile.search_url if profile is not None else "",
+        "use_case": profile.use_case if profile is not None else "",
+        "poll_interval_seconds": (
+            str(profile.poll_interval_seconds) if profile and profile.poll_interval_seconds else ""
+        ),
+    }
+    id_input = (
+        f"<label>Immutable ID<input name='id' required pattern='[a-z][a-z0-9-]{{0,62}}' "
+        f"value='{escape(values['id'])}'></label>"
+        if profile is None
+        else ""
+    )
+    enabled = " checked" if profile is None or profile.enabled else ""
+    return f"""
+    <form class="config-form" method="post" action="{action}{_token_query(request)}">
+      {_token_hidden_input(request)}
+      {id_input}
+      <label>Name<input name="name" required value="{escape(values['name'])}"></label>
+      <label>Marktplaats search URL<input name="search_url" required value="{escape(values['search_url'])}"></label>
+      <label>Evaluation instructions<textarea name="use_case" required>{escape(values['use_case'])}</textarea></label>
+      <label>Interval override (seconds; blank uses global)
+        <input type="number" name="poll_interval_seconds" min="1" value="{escape(values['poll_interval_seconds'])}"></label>
+      <div class="checks"><label><input type="checkbox" name="enabled"{enabled}> Enabled</label></div>
+      <div class="form-actions"><button type="submit">Save profile</button>
+        <a href="/profiles{_token_query(request)}">Cancel</a></div>
+    </form>
+    """
+
+
+def _profile_form_value(form: Mapping[str, list[str]], name: str) -> str:
+    return form.get(name, [""])[0].strip()
+
+
+def _profile_interval(form: Mapping[str, list[str]]) -> int | None:
+    value = _profile_form_value(form, "poll_interval_seconds")
+    return int(value) if value else None
 
 
 def _status_panel(status: RuntimeStatus) -> str:
@@ -1211,9 +2115,13 @@ def _safe_error(prefix: str, error: Exception) -> str:
 
 def _token_hidden_input(request: Request) -> str:
     token = request.query_params.get("token")
-    if not token:
-        return ""
-    return f"<input type='hidden' name='token' value='{escape(token)}'>"
+    profile = request.query_params.get("profile")
+    inputs = []
+    if token:
+        inputs.append(f"<input type='hidden' name='token' value='{escape(token)}'>")
+    if profile:
+        inputs.append(f"<input type='hidden' name='profile' value='{escape(profile)}'>")
+    return "".join(inputs)
 
 
 def _evaluation_action(request: Request) -> str:
@@ -1266,7 +2174,7 @@ def _seen_filter_options(selected: str) -> str:
     )
 
 
-def _seen_ads_table(entries: list[dict[str, Any]]) -> str:
+def _seen_ads_table(entries: list[dict[str, Any]], *, show_profile: bool = False) -> str:
     if not entries:
         return "<p>No seen ads match this filter yet.</p>"
     rows = []
@@ -1287,6 +2195,7 @@ def _seen_ads_table(entries: list[dict[str, Any]]) -> str:
         rows.append(
             f"""
             <tr>
+                            {f"<td>{escape(str(entry.get('profile_name', 'Freezers')))}<span class='secondary'>{escape(str(entry.get('profile_id', 'freezers')))}</span></td>" if show_profile else ''}
               <td><a href="{escape(str(entry.get('url', '')))}" rel="noopener noreferrer"
                 target="_blank">{escape(str(entry.get('title', entry['id'])))}</a>
                 <span class="secondary">{escape(str(entry['id']))}</span></td>
@@ -1299,19 +2208,20 @@ def _seen_ads_table(entries: list[dict[str, Any]]) -> str:
         )
     return f"""
     <div class="table-scroll"><table class="history-table">
-      <thead><tr><th>Ad</th><th>Seen reason</th><th>First seen</th><th>Decision</th></tr></thead>
+            <thead><tr>{'<th>Profile</th>' if show_profile else ''}<th>Ad</th><th>Seen reason</th><th>First seen</th><th>Decision</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table></div>
     """
 
 
-def _preview_summary(service: WatcherService) -> str:
-    if service.preview_fetched_at is None:
+def _preview_summary(service: WatcherService, profile: SearchProfile | None = None) -> str:
+    fetched_at = service.preview_fetched_at_for(profile)
+    if fetched_at is None:
         return "<p class='hint'>No preview fetched in this process yet.</p>"
-    fetched, eligible, filtered = service.preview_counts
+    fetched, eligible, filtered = service.preview_counts_for(profile)
     return (
         f"<p><strong>{fetched}</strong> fetched · <strong>{eligible}</strong> eligible · "
-        f"{filtered} filtered · fetched {_format_time(service.preview_fetched_at)}</p>"
+        f"{filtered} filtered · fetched {_format_time(fetched_at)}</p>"
     )
 
 
@@ -1378,6 +2288,8 @@ def _preview_ads_form(
 def _pipeline_progress_cards(
     request: Request,
     records: list[PipelineProgressRecord],
+    *,
+    read_only: bool = False,
 ) -> str:
     del request
     if not records:
@@ -1391,16 +2303,24 @@ def _pipeline_progress_cards(
         else:
             telegram = "Telegram delivery not tracked by test pipeline"
         source = "Manual AI test" if record.source == "manual_test" else "Production evaluation"
+        profile_badge = ""
+        if record.evaluated_ad.profile_name:
+            profile_badge = (
+                f"<span class='mini-badge'>"
+                f"{escape(record.evaluated_ad.profile_name)} · "
+                f"{escape(record.evaluated_ad.profile_id or '')}</span>"
+            )
         cards.append(
             f"""
             <div class="pipeline-progress">
               <p class="badge-row">
                 <span class="mini-badge status-ok">AI complete · saved</span>
                 <span class="mini-badge">{source}</span>
+                {profile_badge}
                 <span class="mini-badge">{telegram}</span>
                 <span class="hint">Tested {_format_time(record.tested_at)}</span>
               </p>
-              {_evaluation_cards([record.evaluated_ad])}
+              {_evaluation_cards([record.evaluated_ad], show_profile=read_only)}
             </div>
             """
         )
@@ -1465,7 +2385,12 @@ def _evaluation_filter_options(selected_action: str) -> str:
     )
 
 
-def _evaluation_cards(evaluations: list[EvaluatedAd], *, test_only: bool = False) -> str:
+def _evaluation_cards(
+    evaluations: list[EvaluatedAd],
+    *,
+    test_only: bool = False,
+    show_profile: bool = True,
+) -> str:
     if not evaluations:
         return "<p>No evaluations match this filter yet.</p>"
 
@@ -1486,6 +2411,12 @@ def _evaluation_cards(evaluations: list[EvaluatedAd], *, test_only: bool = False
             details = "<details><summary>Signals, concerns, and description</summary>"
             details += f"{signals}{concerns}{description}</details>"
         test_badge = "<span class='mini-badge'>Test only</span>" if test_only else ""
+        profile_badge = ""
+        if show_profile and evaluation.profile_name:
+            profile_badge = (
+                f"<span class='mini-badge'>"
+                f"{escape(evaluation.profile_name)} · {escape(evaluation.profile_id or '')}</span>"
+            )
         cards.append(
             f"""
             <article class="evaluation-card">
@@ -1495,6 +2426,7 @@ def _evaluation_cards(evaluations: list[EvaluatedAd], *, test_only: bool = False
                 </span>
                 <strong>{escape(ad.title)}</strong>
                 {test_badge}
+                {profile_badge}
               </div>
               <p><a href="{escape(ad.url)}" rel="noopener noreferrer" target="_blank">
                 Open Marktplaats ad
@@ -1629,6 +2561,18 @@ def _page(title: str, body: str) -> str:
             text-decoration: none;
         }}
         .main-nav a:hover, .main-nav a.active {{ background: #e5edf5; }}
+        .profile-selector {{
+            align-items: end;
+            background: #eef3f8;
+            border: 1px solid #d5e0eb;
+            border-radius: 7px;
+            display: flex;
+            gap: 0.7rem;
+            margin: -0.6rem 0 1.25rem;
+            padding: 0.7rem;
+        }}
+        .profile-selector label {{ flex: 1 1 18rem; max-width: 28rem; }}
+        .profile-selector button {{ flex: 0 0 auto; }}
         .panel {{
             background: white;
             border: 1px solid #dfe3e7;
@@ -1714,6 +2658,9 @@ def _page(title: str, body: str) -> str:
             gap: 1rem;
             padding-top: 1rem;
         }}
+        .inline-form {{ display: inline-block; margin: 0 0.35rem 0.35rem 0; }}
+        .inline-form button {{ min-height: 2rem; padding: 0.3rem 0.55rem; }}
+        .profile-scope {{ color: #454d55; font-size: 0.9rem; margin: -0.55rem 0 1rem; }}
         .filter-form {{ align-items: end; display: flex; flex-wrap: wrap; gap: 0.75rem; }}
         .filter-form label {{ flex: 0 1 18rem; min-width: 12rem; }}
         .filter-form select {{ max-width: 18rem; }}

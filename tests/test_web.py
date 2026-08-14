@@ -725,12 +725,17 @@ async def test_pipeline_ai_phase_persists_and_advances_without_telegram(
     assert "Telegram not sent" in tested.text
     assert "Send result via Telegram" in tested.text
     assert "Promising dimensions." in tested.text
-    assert SeenStore(state_file).has_seen(preview_ad.id)
-    assert '"reason":"Promising dimensions."' in results_file.read_text(encoding="utf-8")
-    progress = PipelineProgressStore(tmp_path / "pipeline_progress.json").get(preview_ad.id)
+    profile_directory = tmp_path / "profiles" / "freezers"
+    assert SeenStore(profile_directory / "seen_ads.json").has_seen(preview_ad.id)
+    assert '"reason":"Promising dimensions."' in (
+        profile_directory / "evaluations.jsonl"
+    ).read_text(encoding="utf-8")
+    progress = PipelineProgressStore(
+        profile_directory / "pipeline_progress.json"
+    ).get(preview_ad.id)
     assert progress is not None
     assert progress.telegram_sent is False
-    summary = RuntimeStatusStore(status_file).read().last_summary
+    summary = RuntimeStatusStore(profile_directory / "runtime_status.json").read().last_summary
     assert summary is not None
     assert summary.evaluation_failed_count == 0
 
@@ -797,7 +802,9 @@ async def test_pipeline_telegram_phases_are_explicit_and_record_delivery(
     assert "Standalone Telegram test message sent" in standalone.text
     assert sent_ids == ["m1"]
     assert standalone_calls == 1
-    progress = PipelineProgressStore(tmp_path / "pipeline_progress.json").get("m1")
+    progress = PipelineProgressStore(
+        tmp_path / "profiles" / "freezers" / "pipeline_progress.json"
+    ).get("m1")
     assert progress is not None
     assert progress.telegram_sent is True
     assert progress.telegram_message_id == 42

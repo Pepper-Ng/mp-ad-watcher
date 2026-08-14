@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -57,7 +58,15 @@ def _write_legacy_files(data_root: Path, files: dict[str, bytes]) -> None:
 
 @pytest.mark.parametrize(
     "profile_id",
-    ["", "Freezers", "freezers/other", "../freezers", "freezers..", "freezers_name"],
+    [
+        "",
+        "all",
+        "Freezers",
+        "freezers/other",
+        "../freezers",
+        "freezers..",
+        "freezers_name",
+    ],
 )
 def test_profile_registry_rejects_unsafe_profile_ids(profile_id: str) -> None:
     with pytest.raises(ProfileConfigurationError, match="Profile ID"):
@@ -230,3 +239,32 @@ def test_invalid_legacy_data_fails_without_registry_or_partial_migration(tmp_pat
     assert not (data_root / "profiles").exists()
     assert not (data_root / "profile-migrations").exists()
     assert not (data_root / "profile-migration-backups").exists()
+
+
+def test_registry_atomic_mutations_keep_ids_immutable_and_archive_history(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    settings = _settings(data_root)
+    registry = migrate_legacy_single_search(settings).registry
+    store = ProfileRegistryStore(data_root)
+    bicycles = SearchProfile(
+        id="bicycles",
+        name="Bicycles",
+        search_url="https://www.marktplaats.nl/lrp/api/search?query=bicycle",
+        use_case="Find reliable city bicycles.",
+        sort_order=1,
+    )
+
+    store.create(bicycles)
+    updated = store.update(replace(bicycles, name="City bicycles", enabled=False))
+    archived = store.archive("bicycles")
+
+    assert registry.default_profile_id == DEFAULT_PROFILE_ID
+    assert updated.profile("bicycles").id == "bicycles"
+    assert updated.profile("bicycles").name == "City bicycles"
+    assert archived.profile("bicycles").archived is True
+    assert archived.profile("bicycles").enabled is False
+    assert [profile.id for profile in archived.active_profiles] == [DEFAULT_PROFILE_ID]
+    with pytest.raises(ProfileConfigurationError, match="default Freezers"):
+        store.archive(DEFAULT_PROFILE_ID)
+    with pytest.raises(ProfileConfigurationError, match="Archived"):
+        store.set_enabled("bicycles", enabled=True)

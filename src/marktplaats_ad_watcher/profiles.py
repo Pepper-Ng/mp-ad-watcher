@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,7 +24,9 @@ PROFILE_REGISTRY_SCHEMA_VERSION = 1
 MIGRATION_MANIFEST_SCHEMA_VERSION = 1
 
 _PROFILE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+_RESERVED_PROFILE_IDS = {"all"}
 _MIGRATION_LOCK = threading.Lock()
+_PROFILE_REGISTRY_LOCK = threading.Lock()
 
 
 class ProfileConfigurationError(ValueError):
@@ -47,6 +49,7 @@ class SearchProfile:
     sort_order: int = 0
     bootstrap_existing_ads: bool = False
     poll_interval_seconds: int | None = None
+    archived: bool = False
 
     def __post_init__(self) -> None:
         _validate_profile_id(self.id)
@@ -69,6 +72,8 @@ class SearchProfile:
             raise ProfileConfigurationError(
                 "Profile poll_interval_seconds must be a positive integer or null."
             )
+        if not isinstance(self.archived, bool):
+            raise ProfileConfigurationError("Profile archived must be a boolean.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +85,7 @@ class SearchProfile:
             "sort_order": self.sort_order,
             "bootstrap_existing_ads": self.bootstrap_existing_ads,
             "poll_interval_seconds": self.poll_interval_seconds,
+            "archived": self.archived,
         }
 
     @classmethod
@@ -95,6 +101,7 @@ class SearchProfile:
             sort_order=value.get("sort_order", 0),
             bootstrap_existing_ads=value.get("bootstrap_existing_ads", False),
             poll_interval_seconds=value.get("poll_interval_seconds"),
+            archived=value.get("archived", False),
         )
 
 
@@ -122,6 +129,8 @@ class ProfileRegistry:
             raise ProfileConfigurationError("Profile registry contains duplicate profile IDs.")
         if self.default_profile_id not in ids:
             raise ProfileConfigurationError("Default profile ID does not exist in the registry.")
+        if self.default_profile.archived:
+            raise ProfileConfigurationError("The default profile must not be archived.")
 
         sort_orders = [profile.sort_order for profile in self.profiles]
         if len(sort_orders) != len(set(sort_orders)):
@@ -132,6 +141,17 @@ class ProfileRegistry:
     @property
     def default_profile(self) -> SearchProfile:
         return self.profile(self.default_profile_id)
+
+    @property
+    def active_profiles(self) -> tuple[SearchProfile, ...]:
+        """Return non-archived profiles in their stable display and schedule order."""
+
+        return tuple(
+            sorted(
+                (profile for profile in self.profiles if not profile.archived),
+                key=lambda profile: profile.sort_order,
+            )
+        )
 
     def profile(self, profile_id: str) -> SearchProfile:
         for profile in self.profiles:
@@ -334,20 +354,22 @@ class MigrationManifest:
         )
 
     def verify_profile_copies(self, data_root: Path) -> None:
-        storage = ProfileStoragePaths(data_root, self.profile_id)
         backup_directory = _migration_backup_directory(data_root)
         for file in self.files:
-            profile_path = storage.directory / file.name
             backup_path = backup_directory / file.name
             if not file.source_exists:
-                if profile_path.exists() or backup_path.exists():
+                if backup_path.exists():
                     raise ProfileMigrationError(
-                        f"Migration manifest expects no copy of {file.name}, but one exists."
+                        f"Migration manifest expects no backup of {file.name}, but one exists."
                     )
+                # A profile file may be created during normal runtime after an empty legacy
+                # source was migrated. It is no longer a migration copy and must be retained.
                 continue
 
-            _verify_file_integrity(profile_path, file, "profile copy")
             _verify_file_integrity(backup_path, file, "backup copy")
+            # Profile-local state is intentionally mutable after activation. The migration
+            # procedure already verified this initial copy before writing the manifest; future
+            # verification protects the retained immutable backup without rejecting normal runs.
 
 
 @dataclass(frozen=True)
@@ -482,11 +504,16 @@ class ProfileRegistryStore:
         return self._data_root / PROFILE_REGISTRY_FILENAME
 
     def load_if_exists(self) -> ProfileRegistry | None:
-        if not self.path.exists():
-            return None
-        return self.load()
+        with _PROFILE_REGISTRY_LOCK:
+            if not self.path.exists():
+                return None
+            return self._load()
 
     def load(self) -> ProfileRegistry:
+        with _PROFILE_REGISTRY_LOCK:
+            return self._load()
+
+    def _load(self) -> ProfileRegistry:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -496,7 +523,107 @@ class ProfileRegistryStore:
         return ProfileRegistry.from_dict(value)
 
     def save_new(self, registry: ProfileRegistry) -> None:
-        _write_new_json(self.path, registry.to_dict(), self._data_root)
+        with _PROFILE_REGISTRY_LOCK:
+            _write_new_json(self.path, registry.to_dict(), self._data_root)
+
+    def update(self, profile: SearchProfile) -> ProfileRegistry:
+        """Atomically replace one profile without allowing its identifier to change."""
+
+        with _PROFILE_REGISTRY_LOCK:
+            registry = self._load()
+            profiles = list(registry.profiles)
+            for index, existing in enumerate(profiles):
+                if existing.id != profile.id:
+                    continue
+                profiles[index] = profile
+                updated = ProfileRegistry(
+                    default_profile_id=registry.default_profile_id,
+                    profiles=tuple(profiles),
+                )
+                self._replace(updated)
+                return updated
+        raise ProfileConfigurationError(f"Unknown profile ID: {profile.id}.")
+
+    def create(self, profile: SearchProfile) -> ProfileRegistry:
+        """Atomically append a validated profile while preserving existing order."""
+
+        with _PROFILE_REGISTRY_LOCK:
+            registry = self._load()
+            if any(existing.id == profile.id for existing in registry.profiles):
+                raise ProfileConfigurationError(f"Profile ID already exists: {profile.id}.")
+            if any(existing.sort_order == profile.sort_order for existing in registry.profiles):
+                raise ProfileConfigurationError(
+                    f"Profile sort_order already exists: {profile.sort_order}."
+                )
+            updated = ProfileRegistry(
+                default_profile_id=registry.default_profile_id,
+                profiles=(*registry.profiles, profile),
+            )
+            self._replace(updated)
+            return updated
+
+    def set_enabled(self, profile_id: str, *, enabled: bool) -> ProfileRegistry:
+        """Atomically enable or pause one non-archived profile."""
+
+        with _PROFILE_REGISTRY_LOCK:
+            registry = self._load()
+            existing = registry.profile(profile_id)
+            if existing.archived:
+                raise ProfileConfigurationError("Archived profiles cannot be enabled or paused.")
+            profiles = tuple(
+                replace(profile, enabled=enabled) if profile.id == profile_id else profile
+                for profile in registry.profiles
+            )
+            updated = ProfileRegistry(
+                default_profile_id=registry.default_profile_id,
+                profiles=profiles,
+            )
+            self._replace(updated)
+            return updated
+
+    def archive(self, profile_id: str) -> ProfileRegistry:
+        """Atomically archive a profile and retain all profile-local history."""
+
+        with _PROFILE_REGISTRY_LOCK:
+            registry = self._load()
+            existing = registry.profile(profile_id)
+            if profile_id == registry.default_profile_id:
+                raise ProfileConfigurationError("The default Freezers profile cannot be archived.")
+            if existing.archived:
+                return registry
+            profiles = tuple(
+                replace(profile, enabled=False, archived=True)
+                if profile.id == profile_id
+                else profile
+                for profile in registry.profiles
+            )
+            updated = ProfileRegistry(
+                default_profile_id=registry.default_profile_id,
+                profiles=profiles,
+            )
+            self._replace(updated)
+            return updated
+
+    def next_sort_order(self) -> int:
+        registry = self.load()
+        return max(profile.sort_order for profile in registry.profiles) + 1
+
+    def _replace(self, registry: ProfileRegistry) -> None:
+        encoded = (json.dumps(registry.to_dict(), indent=2, sort_keys=True) + "\n").encode("utf-8")
+        _assert_destination_within_data_root(self.path, self._data_root)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as output:
+                output.write(encoded)
+            temporary.replace(self.path)
+        except OSError as error:
+            raise ProfileConfigurationError(
+                f"Could not save profile registry {self.path}: {error}"
+            ) from error
+        finally:
+            if temporary.exists():
+                temporary.unlink(missing_ok=True)
 
 
 def profile_storage_paths(data_root: Path, profile_id: str) -> ProfileStoragePaths:
@@ -816,6 +943,8 @@ def _validate_profile_id(profile_id: str) -> None:
             "Profile ID must use lowercase letters, digits, and hyphens, start with a letter, "
             "and be at most 63 characters."
         )
+    if profile_id in _RESERVED_PROFILE_IDS:
+        raise ProfileConfigurationError(f"Profile ID is reserved: {profile_id}.")
 
 
 def _validate_http_url(name: str, value: str) -> None:

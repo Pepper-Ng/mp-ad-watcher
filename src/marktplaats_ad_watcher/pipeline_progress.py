@@ -26,7 +26,7 @@ class PipelineProgressStore:
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def list(self) -> list[PipelineProgressRecord]:
+    def records(self) -> list[PipelineProgressRecord]:
         with _PROGRESS_LOCK:
             records = self._load()
         return sorted(records.values(), key=lambda record: record.tested_at, reverse=True)
@@ -67,7 +67,7 @@ class PipelineProgressStore:
 
     def sync_evaluations(self, path: Path) -> list[PipelineProgressRecord]:
         if not path.exists():
-            return self.list()
+            return self.records()
         with _PROGRESS_LOCK:
             records = self._load()
             changed = False
