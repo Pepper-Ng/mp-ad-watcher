@@ -73,6 +73,18 @@ class EvaluatedAd(BaseModel):
     ad: Ad
     result: EvaluationResult
     evaluated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    profile_id: str | None = None
+    profile_name: str | None = None
+
+    @field_validator("profile_id", "profile_name")
+    @classmethod
+    def profile_metadata_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Profile metadata must not be blank.")
+        return stripped
 
 
 class TelegramSendResult(BaseModel):

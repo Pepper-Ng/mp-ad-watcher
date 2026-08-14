@@ -16,6 +16,7 @@ from marktplaats_ad_watcher.profiles import (
     ProfileRegistryStore,
     SearchProfile,
     migrate_legacy_single_search,
+    verify_profile_registry,
 )
 
 
@@ -160,6 +161,11 @@ def test_migration_copies_legacy_data_with_verified_manifest_and_global_quota(
     assert usage_integrity["source_sha256"] == hashlib.sha256(
         legacy_files["model_usage.json"]
     ).hexdigest()
+
+    verification = verify_profile_registry(settings)
+    assert verification.migrated is False
+    assert verification.manifest_path == result.manifest_path
+    assert verification.registry.default_profile_id == DEFAULT_PROFILE_ID
 
 
 def test_migration_is_idempotent_and_retains_legacy_originals(tmp_path: Path) -> None:

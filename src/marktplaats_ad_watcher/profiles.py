@@ -46,6 +46,7 @@ class SearchProfile:
     enabled: bool = True
     sort_order: int = 0
     bootstrap_existing_ads: bool = False
+    poll_interval_seconds: int | None = None
 
     def __post_init__(self) -> None:
         _validate_profile_id(self.id)
@@ -60,6 +61,14 @@ class SearchProfile:
             raise ProfileConfigurationError("Profile sort_order must be an integer.")
         if not isinstance(self.bootstrap_existing_ads, bool):
             raise ProfileConfigurationError("Profile bootstrap_existing_ads must be a boolean.")
+        if self.poll_interval_seconds is not None and (
+            not isinstance(self.poll_interval_seconds, int)
+            or isinstance(self.poll_interval_seconds, bool)
+            or self.poll_interval_seconds < 1
+        ):
+            raise ProfileConfigurationError(
+                "Profile poll_interval_seconds must be a positive integer or null."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +79,7 @@ class SearchProfile:
             "enabled": self.enabled,
             "sort_order": self.sort_order,
             "bootstrap_existing_ads": self.bootstrap_existing_ads,
+            "poll_interval_seconds": self.poll_interval_seconds,
         }
 
     @classmethod
@@ -84,6 +94,7 @@ class SearchProfile:
             enabled=value.get("enabled", True),
             sort_order=value.get("sort_order", 0),
             bootstrap_existing_ads=value.get("bootstrap_existing_ads", False),
+            poll_interval_seconds=value.get("poll_interval_seconds"),
         )
 
 
@@ -366,8 +377,8 @@ class _LegacySnapshot:
 def migrate_legacy_single_search(settings: Settings) -> ProfileMigrationResult:
     """Create and verify the default profile from legacy single-search persistence.
 
-    This function is intentionally not wired into the current runner or web service. Future entry
-    points can call it before activating profile-scoped execution.
+    Profile-aware execution calls this before activating the registry. The legacy web service
+    continues to use its existing single-search paths until its profile UI phase is implemented.
     """
 
     data_root = settings.data_root
@@ -404,9 +415,7 @@ def migrate_legacy_single_search(settings: Settings) -> ProfileMigrationResult:
             use_case=settings.marktplaats_use_case,
             enabled=True,
             sort_order=0,
-            bootstrap_existing_ads=(
-                False if has_legacy_search_data else settings.bootstrap_existing_ads
-            ),
+            bootstrap_existing_ads=False,
         )
         registry = ProfileRegistry(
             default_profile_id=DEFAULT_PROFILE_ID,
@@ -437,6 +446,29 @@ def ensure_profile_registry(settings: Settings) -> ProfileMigrationResult:
     """Compatibility-friendly alias for future CLI and web activation code."""
 
     return migrate_legacy_single_search(settings)
+
+
+def verify_profile_registry(settings: Settings) -> ProfileMigrationResult:
+    """Verify an existing profile registry and migration copies without changing data."""
+
+    data_root = settings.data_root
+    registry_store = ProfileRegistryStore(data_root)
+    manifest_path = _migration_manifest_path(data_root)
+
+    with _MIGRATION_LOCK:
+        registry = registry_store.load_if_exists()
+        if registry is None:
+            raise ProfileMigrationError("Profile registry has not been initialized.")
+        if not manifest_path.exists():
+            return ProfileMigrationResult(registry=registry, migrated=False, manifest_path=None)
+
+        manifest = _load_manifest(manifest_path)
+        _verify_activated_migration(registry, manifest, data_root)
+        return ProfileMigrationResult(
+            registry=registry,
+            migrated=False,
+            manifest_path=manifest_path,
+        )
 
 
 class ProfileRegistryStore:

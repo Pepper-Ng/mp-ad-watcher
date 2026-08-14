@@ -4,7 +4,18 @@
 
 This document records the feasibility assessment for generalizing the watcher from one Marktplaats search to multiple independent searches. It is a handoff for the agent that implements the feature.
 
-**No implementation or deployment changes have been made for this feature.**
+Implementation status:
+
+- **Phase 1 complete:** versioned profile registry, verified legacy migration, isolated storage
+  paths, and the migrated `freezers` default profile are implemented.
+- **Phase 2 complete:** CLI execution activates and verifies the profile registry before running,
+  can run a selected/default profile or all profiles sequentially, records profile-local schedule
+  state, isolates profile failures, and shares the root model quota.
+- **Deferred:** profile UI/CRUD, profile selection in the existing web flows, and Telegram profile
+  labels remain future work. The legacy web service intentionally retains its existing single-search
+  paths until that UI phase is implemented.
+
+No deployment changes have been made for this feature.
 
 Current baseline:
 

@@ -47,6 +47,7 @@ class Settings:
     dry_run: bool = False
     persistent_data_root: Path | None = None
     active_profile_id: str | None = None
+    active_profile_name: str | None = None
 
     def __post_init__(self) -> None:
         preset = provider_preset(self.model_provider)
@@ -84,6 +85,12 @@ class Settings:
     def global_model_usage_file(self) -> Path:
         return self.data_root / "model_usage.json"
 
+    @property
+    def pipeline_progress_file(self) -> Path:
+        """Persistent pipeline progress owned by this settings instance's search scope."""
+
+        return self.results_file.parent / "pipeline_progress.json"
+
     def legacy_search_file_paths(self) -> dict[str, Path]:
         """Return legacy single-search persistence paths without including global usage."""
 
@@ -104,12 +111,18 @@ class Settings:
             self,
             marktplaats_search_url=profile.search_url,
             marktplaats_use_case=profile.use_case,
+            poll_interval_seconds=(
+                profile.poll_interval_seconds
+                if profile.poll_interval_seconds is not None
+                else self.poll_interval_seconds
+            ),
             bootstrap_existing_ads=profile.bootstrap_existing_ads,
             state_file=paths.state_file,
             results_file=paths.results_file,
             status_file=paths.status_file,
             persistent_data_root=self.data_root,
             active_profile_id=profile.id,
+            active_profile_name=profile.name,
         )
 
     @staticmethod

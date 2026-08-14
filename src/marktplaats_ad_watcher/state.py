@@ -51,8 +51,13 @@ class SeenStore:
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
 
+        absent_profile_fields = {
+            field
+            for field in ("profile_id", "profile_name")
+            if getattr(evaluated_ad, field) is None
+        }
         with path.open("a", encoding="utf-8") as output:
-            output.write(evaluated_ad.model_dump_json() + "\n")
+            output.write(evaluated_ad.model_dump_json(exclude=absent_profile_fields) + "\n")
 
     def _load(self) -> dict[str, Any]:
         if not self._path.exists():
