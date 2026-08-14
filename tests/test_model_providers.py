@@ -60,8 +60,32 @@ def _ad() -> Ad:
         id="m1",
         title="Chest freezer",
         url="https://example.test/m1",
+        description="A complete listing description with stated dimensions.",
         image_urls=["https://example.test/1.jpg", "https://example.test/2.jpg"],
     )
+
+
+def test_text_only_prompt_omits_all_image_information() -> None:
+    prompt = build_evaluation_prompt("Find chest freezers.", _ad())
+
+    assert prompt.image_urls == []
+    assert "Image URLs:" not in prompt.user
+    assert "images" not in prompt.user
+    assert "images" not in prompt.system
+    assert "Description: A complete listing description" in prompt.user
+
+
+def test_image_aware_prompt_includes_attached_image_context() -> None:
+    prompt = build_evaluation_prompt(
+        "Find chest freezers.",
+        _ad(),
+        include_image_content=True,
+    )
+
+    assert prompt.image_urls == ["https://example.test/1.jpg", "https://example.test/2.jpg"]
+    assert "Image URLs:" in prompt.user
+    assert "images" in prompt.user
+    assert "images are attached separately" in prompt.system
 
 
 def test_provider_factory_selects_protocol_adapter(tmp_path: Path) -> None:
@@ -104,7 +128,11 @@ def test_openai_compatible_request_supports_json_reasoning_and_images(tmp_path: 
     evaluator = OpenAICompatibleEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(settings.marktplaats_use_case, _ad())
+        build_evaluation_prompt(
+            settings.marktplaats_use_case,
+            _ad(),
+            include_image_content=settings.send_image_content_to_model,
+        )
     )
 
     assert endpoint.endswith("/v1beta/openai/chat/completions")
@@ -118,7 +146,13 @@ def test_deepseek_omits_unsupported_reasoning_effort(tmp_path: Path) -> None:
     settings = _settings(tmp_path, model_reasoning_effort="medium")
     evaluator = OpenAICompatibleEvaluator(settings)
 
-    _, _, payload = evaluator.request(build_evaluation_prompt(settings.marktplaats_use_case, _ad()))
+    _, _, payload = evaluator.request(
+        build_evaluation_prompt(
+            settings.marktplaats_use_case,
+            _ad(),
+            include_image_content=settings.send_image_content_to_model,
+        )
+    )
 
     assert "reasoning_effort" not in payload
 
@@ -136,7 +170,11 @@ def test_openai_responses_request_uses_native_schema_reasoning_and_images(tmp_pa
     evaluator = OpenAIResponsesEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(settings.marktplaats_use_case, _ad())
+        build_evaluation_prompt(
+            settings.marktplaats_use_case,
+            _ad(),
+            include_image_content=settings.send_image_content_to_model,
+        )
     )
 
     assert endpoint == "https://api.openai.com/v1/responses"
@@ -164,7 +202,11 @@ def test_openai_sends_temperature_only_when_reasoning_is_disabled(tmp_path: Path
     without_reasoning = OpenAIResponsesEvaluator(
         replace(base, model_reasoning_effort="none")
     )
-    prompt = build_evaluation_prompt(base.marktplaats_use_case, _ad())
+    prompt = build_evaluation_prompt(
+        base.marktplaats_use_case,
+        _ad(),
+        include_image_content=base.send_image_content_to_model,
+    )
 
     _, _, reasoning_payload = with_reasoning.request(prompt)
     _, _, no_reasoning_payload = without_reasoning.request(prompt)
@@ -186,7 +228,11 @@ def test_anthropic_request_uses_native_headers_schema_and_images(tmp_path: Path)
     evaluator = AnthropicMessagesEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(settings.marktplaats_use_case, _ad())
+        build_evaluation_prompt(
+            settings.marktplaats_use_case,
+            _ad(),
+            include_image_content=settings.send_image_content_to_model,
+        )
     )
 
     assert endpoint == "https://api.anthropic.com/v1/messages"

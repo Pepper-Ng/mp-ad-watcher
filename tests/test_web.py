@@ -670,6 +670,8 @@ async def test_pipeline_ai_phase_persists_and_advances_without_telegram(
     class FakeEvaluator:
         async def evaluate(self, ad: Ad) -> EvaluationResult:
             assert ad.id == preview_ad.id
+            assert ad.description == "Full listing description."
+            assert ad.listing_facts == {"Capacity": "458 L"}
             return EvaluationResult(
                 relevant=True,
                 confidence=0.8,
@@ -679,6 +681,18 @@ async def test_pipeline_ai_phase_persists_and_advances_without_telegram(
             )
 
     monkeypatch.setattr(WatcherService, "fetch_preview", fake_fetch_preview)
+    async def fake_enrich_ad(_: object, ad: Ad) -> Ad:
+        return ad.model_copy(
+            update={
+                "description": "Full listing description.",
+                "listing_facts": {"Capacity": "458 L"},
+            }
+        )
+
+    monkeypatch.setattr(
+        "marktplaats_ad_watcher.web.MarktplaatsClient.enrich_ad",
+        fake_enrich_ad,
+    )
     monkeypatch.setattr(
         "marktplaats_ad_watcher.web.build_model_evaluator",
         lambda _: FakeEvaluator(),

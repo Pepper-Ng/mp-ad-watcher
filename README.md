@@ -10,6 +10,9 @@ notifications.
 - Keeps `STATE_FILE` so older ads are not evaluated again.
 - On the first normal run, marks the current result set as seen by default. This avoids notifying you about all existing ads.
 - Filters out `a...` Admarkt/commercial-style listings by default.
+- Loads the full Marktplaats detail page for each newly found ad before AI evaluation, including the
+  complete description and visible listing characteristics. Existing/baseline ads are not reloaded
+  on every poll.
 - Sends each new ad to a strict JSON evaluator.
 - Appends each evaluation to `RESULTS_FILE`, so another flow can consume it.
 - Sends a Telegram message for `next_action="notify"`, and also for `next_action="review"` by default so plausible ads are not missed.
@@ -156,8 +159,9 @@ REVIEW_MIN_CONFIDENCE=0
 
 ## Image handling
 
-Image URLs are always present as ad metadata in the text prompt. To also ask a vision-capable model
-to inspect image content, set:
+By default the evaluator receives no image URLs, image attachments, or image-specific instructions.
+To ask a vision-capable model to inspect listing images, enable this in the web configuration page
+or set:
 
 ```env
 SEND_IMAGE_CONTENT_TO_MODEL=true
@@ -165,7 +169,8 @@ SEND_IMAGE_CONTENT_TO_MODEL=true
 
 The code sends up to `MAX_IMAGES_FOR_MODEL` images using the content shape required by the chosen
 protocol: OpenAI-compatible `image_url`, OpenAI Responses `input_image`, or Anthropic URL image
-blocks. Leave this disabled for text-only models.
+blocks. The system prompt also explicitly tells the model to inspect the attached images. Leave
+this disabled for text-only models or when image analysis is not wanted.
 
 ## JSON evaluation shape
 

@@ -4,6 +4,7 @@ import html
 import json
 import re
 from collections.abc import Iterable
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin
 
@@ -36,6 +37,23 @@ class MarktplaatsClient:
         payload = _payload_from_response(response)
         return normalize_ads(payload)[:limit]
 
+    async def enrich_ad(self, ad: Ad) -> Ad:
+        """Add the full detail-page description and listed characteristics to an ad.
+
+        Search results intentionally remain lightweight. The runner calls this only after it
+        determines an ad is new, avoiding a detail-page request for every result on every poll.
+        """
+
+        async with httpx.AsyncClient(
+            timeout=self._timeout_seconds,
+            follow_redirects=True,
+            headers=self._headers,
+        ) as client:
+            response = await client.get(ad.url)
+            response.raise_for_status()
+
+        return enrich_ad_from_detail_html(ad, response.text)
+
 
 def normalize_ads(payload: Any) -> list[Ad]:
     ads: list[Ad] = []
@@ -54,6 +72,27 @@ def normalize_ads(payload: Any) -> list[Ad]:
         ads.append(ad)
 
     return ads
+
+
+def enrich_ad_from_detail_html(ad: Ad, html_document: str) -> Ad:
+    """Merge full, visible listing details from a Marktplaats detail page into ``ad``.
+
+    The search API provides a shortened description. Marktplaats renders the complete description
+    and selected characteristics in the server HTML, which lets the evaluator use the same facts a
+    person sees without relying on a browser-only page.
+    """
+
+    parser = _ListingDetailParser()
+    parser.feed(html_document)
+    parser.close()
+
+    updates: dict[str, Any] = {}
+    if parser.description and len(parser.description) >= len(ad.description or ""):
+        updates["description"] = parser.description
+    if parser.listing_facts:
+        updates["listing_facts"] = {**ad.listing_facts, **parser.listing_facts}
+
+    return ad.model_copy(update=updates) if updates else ad
 
 
 def _payload_from_response(response: httpx.Response) -> Any:
@@ -143,20 +182,20 @@ def _find_first_string(current: Any, names: list[str]) -> str | None:
     if isinstance(current, dict):
         for key, value in current.items():
             if key.lower() in normalized_names and isinstance(value, str | int | float):
-                result = str(value).strip()
-                if result:
-                    return result
+                direct_text = str(value).strip()
+                if direct_text:
+                    return direct_text
 
         for value in current.values():
-            result = _find_first_string(value, names)
-            if result:
-                return result
+            nested_text = _find_first_string(value, names)
+            if nested_text:
+                return nested_text
 
     if isinstance(current, list):
         for value in current:
-            result = _find_first_string(value, names)
-            if result:
-                return result
+            nested_text = _find_first_string(value, names)
+            if nested_text:
+                return nested_text
 
     return None
 
@@ -295,3 +334,74 @@ def _walk_strings(current: Any) -> Iterable[str]:
     elif isinstance(current, list):
         for value in current:
             yield from _walk_strings(value)
+
+
+class _ListingDetailParser(HTMLParser):
+    """Extract the visible description and characteristic labels from listing HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.description = ""
+        self.listing_facts: dict[str, str] = {}
+        self._open_divs = 0
+        self._description_depth: int | None = None
+        self._description_parts: list[str] = []
+        self._field_kind: str | None = None
+        self._field_depth: int | None = None
+        self._field_parts: list[str] = []
+        self._pending_label: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "br" and self._description_depth is not None:
+            self._description_parts.append("\n")
+            return
+        if tag != "div":
+            return
+
+        self._open_divs += 1
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if attributes.get("data-collapsable") == "description":
+            self._description_depth = self._open_divs
+            self._description_parts = []
+        if "Attributes-module-label" in classes:
+            self._start_field("label")
+        elif "Attributes-module-value" in classes:
+            self._start_field("value")
+
+    def handle_data(self, data: str) -> None:
+        if self._description_depth is not None:
+            self._description_parts.append(data)
+        if self._field_kind is not None:
+            self._field_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "div":
+            return
+
+        if self._field_depth == self._open_divs:
+            value = _normalise_detail_text("".join(self._field_parts))
+            if self._field_kind == "label":
+                self._pending_label = value or None
+            elif self._field_kind == "value" and self._pending_label and value:
+                self.listing_facts[self._pending_label] = value
+                self._pending_label = None
+            self._field_kind = None
+            self._field_depth = None
+            self._field_parts = []
+
+        if self._description_depth == self._open_divs:
+            self.description = _normalise_detail_text("".join(self._description_parts))
+            self._description_depth = None
+            self._description_parts = []
+
+        self._open_divs -= 1
+
+    def _start_field(self, kind: str) -> None:
+        self._field_kind = kind
+        self._field_depth = self._open_divs
+        self._field_parts = []
+
+
+def _normalise_detail_text(value: str) -> str:
+    return " ".join(value.split())

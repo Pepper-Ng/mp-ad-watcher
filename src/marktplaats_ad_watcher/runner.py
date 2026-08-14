@@ -23,6 +23,8 @@ LOGGER = logging.getLogger(__name__)
 class AdFetcher(Protocol):
     async def fetch_ads(self, search_url: str, /, *, limit: int) -> list[Ad]: ...
 
+    async def enrich_ad(self, ad: Ad, /) -> Ad: ...
+
 
 class Notifier(Protocol):
     async def send(self, evaluated_ad: EvaluatedAd, /) -> TelegramSendResult: ...
@@ -102,9 +104,11 @@ class Watcher:
 
         for ad in new_ads:
             try:
-                result = await self._evaluator.evaluate(ad)
+                enriched_ad = await self._enrich_ad(ad)
             except Exception as error:
-                LOGGER.exception("Failed to evaluate ad %s (%s).", ad.id, ad.title)
+                LOGGER.exception(
+                    "Failed to load full listing details for ad %s (%s).", ad.id, ad.title
+                )
                 evaluation_failures.append(
                     EvaluationFailure(
                         ad_id=ad.id,
@@ -115,7 +119,23 @@ class Watcher:
                 )
                 continue
 
-            evaluated_ad = EvaluatedAd(ad=ad, result=result)
+            try:
+                result = await self._evaluator.evaluate(enriched_ad)
+            except Exception as error:
+                LOGGER.exception(
+                    "Failed to evaluate ad %s (%s).", enriched_ad.id, enriched_ad.title
+                )
+                evaluation_failures.append(
+                    EvaluationFailure(
+                        ad_id=enriched_ad.id,
+                        title=enriched_ad.title,
+                        url=enriched_ad.url,
+                        error=_evaluation_failure_message(error),
+                    )
+                )
+                continue
+
+            evaluated_ad = EvaluatedAd(ad=enriched_ad, result=result)
             evaluated_count += 1
             if result.next_action == "ignore":
                 ignored_count += 1
@@ -162,7 +182,7 @@ class Watcher:
                             )
 
             if not self._settings.dry_run:
-                self._store.mark_seen(ad, result)
+                self._store.mark_seen(enriched_ad, result)
 
         return WatcherRunSummary(
             fetched_count=len(fetched_ads),
@@ -177,6 +197,9 @@ class Watcher:
             evaluation_failed_count=len(evaluation_failures),
             evaluation_failures=evaluation_failures,
         )
+
+    async def _enrich_ad(self, ad: Ad) -> Ad:
+        return await self._marktplaats_client.enrich_ad(ad)
 
     async def run_loop(self) -> None:
         while True:

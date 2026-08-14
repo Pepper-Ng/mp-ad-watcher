@@ -16,10 +16,20 @@ from marktplaats_ad_watcher.status import RuntimeStatusStore
 class FakeMarktplaatsClient:
     def __init__(self, ads: list[Ad]) -> None:
         self._ads = ads
+        self.enriched_ids: list[str] = []
 
     async def fetch_ads(self, search_url: str, *, limit: int) -> list[Ad]:
         del search_url
         return self._ads[:limit]
+
+    async def enrich_ad(self, ad: Ad) -> Ad:
+        self.enriched_ids.append(ad.id)
+        return ad.model_copy(
+            update={
+                "description": "Full detail-page description.",
+                "listing_facts": {"Capacity": "458 L"},
+            }
+        )
 
 
 class RecordingEvaluator:
@@ -144,6 +154,68 @@ async def test_review_actions_are_stored_and_sent_to_telegram(tmp_path: Path) ->
     reloaded = SeenStore(settings.state_file)
     assert reloaded.has_seen("m123")
     assert '"next_action":"review"' in settings.results_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_new_ads_are_enriched_before_model_evaluation(tmp_path: Path) -> None:
+    class CapturingEvaluator(RecordingEvaluator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.evaluated_ads: list[Ad] = []
+
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            self.evaluated_ads.append(ad)
+            return await super().evaluate(ad)
+
+    client = FakeMarktplaatsClient(
+        [Ad(id="m123", title="Freezer chest", url="https://example.test/m123")]
+    )
+    evaluator = CapturingEvaluator()
+    settings = _settings(tmp_path)
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=client,
+        evaluator=evaluator,
+        notifier=FakeNotifier(),
+        store=SeenStore(settings.state_file),
+    )
+
+    await watcher.run_once()
+
+    assert client.enriched_ids == ["m123"]
+    assert evaluator.evaluated_ads[0].description == "Full detail-page description."
+    assert evaluator.evaluated_ads[0].listing_facts == {"Capacity": "458 L"}
+
+
+@pytest.mark.asyncio
+async def test_detail_page_failure_leaves_ad_pending_without_model_evaluation(
+    tmp_path: Path,
+) -> None:
+    class FailingDetailClient(FakeMarktplaatsClient):
+        async def enrich_ad(self, ad: Ad) -> Ad:
+            del ad
+            raise RuntimeError("Marktplaats detail page is temporarily unavailable.")
+
+    client = FailingDetailClient(
+        [Ad(id="m123", title="Freezer chest", url="https://example.test/m123")]
+    )
+    evaluator = RecordingEvaluator()
+    settings = _settings(tmp_path)
+    store = SeenStore(settings.state_file)
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=client,
+        evaluator=evaluator,
+        notifier=FakeNotifier(),
+        store=store,
+    )
+
+    summary = await watcher.run_once()
+
+    assert summary.evaluation_failed_count == 1
+    assert "detail page is temporarily unavailable" in summary.evaluation_failures[0].error
+    assert evaluator.evaluated_ids == []
+    assert not store.has_seen("m123")
 
 
 @pytest.mark.asyncio

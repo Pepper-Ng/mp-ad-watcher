@@ -35,8 +35,10 @@ OpenAI-compatible provider. The remaining options are:
 - `MODEL_JSON_MODE`: asks the provider for structured JSON. Keep it enabled for presets. Disable it
   for a custom compatibility endpoint that rejects `response_format`; local Pydantic validation is
   always performed.
-- `SEND_IMAGE_CONTENT_TO_MODEL`: sends image URLs using the chosen protocol's native content-block
-  shape. Only enable it for a vision-capable model.
+- `SEND_IMAGE_CONTENT_TO_MODEL`: when enabled, sends image URLs using the chosen protocol's native
+  content-block shape and tells the model to inspect the attached images. It is disabled by
+  default; when disabled, no image URLs, image attachments, or image-specific instructions are
+  sent. Only enable it for a vision-capable model.
 - `MAX_IMAGES_FOR_MODEL`: caps the number of image inputs per ad.
 
 Not every advanced control applies to every provider. The web page hides and disables controls

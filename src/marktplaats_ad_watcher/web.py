@@ -249,8 +249,14 @@ class WatcherService:
         if ad is None:
             raise ValueError("The preview expired or the selected ad is unavailable. Fetch again.")
         settings = self._load_settings()
-        result = await build_model_evaluator(settings).evaluate(ad)
-        evaluated_ad = EvaluatedAd(ad=ad, result=result)
+        client = MarktplaatsClient(
+            timeout_seconds=settings.request_timeout_seconds,
+            user_agent=settings.user_agent,
+        )
+        enriched_ad = await client.enrich_ad(ad)
+        self._preview_ads[enriched_ad.id] = enriched_ad
+        result = await build_model_evaluator(settings).evaluate(enriched_ad)
+        evaluated_ad = EvaluatedAd(ad=enriched_ad, result=result)
         seen_store = SeenStore(settings.state_file)
         seen_store.append_result(settings.results_file, evaluated_ad)
         seen_store.mark_seen(ad, result)
@@ -774,7 +780,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             "NOTIFY_REVIEW_ACTIONS", values, "Send reviews to Telegram"
         )
         send_images_checkbox = _checkbox(
-            "SEND_IMAGE_CONTENT_TO_MODEL", values, "Send model images"
+            "SEND_IMAGE_CONTENT_TO_MODEL", values, "Allow model to inspect listing images"
         )
         disable_previews_checkbox = _checkbox(
             "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", values, "Disable previews"
@@ -835,6 +841,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                                 {_checkbox("MODEL_JSON_MODE", values, "Structured JSON output")}
                                 {send_images_checkbox}
                             </div>
+                            <p class="hint">Off by default. When disabled, no image URLs or image
+                            instructions are sent to the model.</p>
                         </details>
                         {_provider_defaults_script()}
                     </fieldset>

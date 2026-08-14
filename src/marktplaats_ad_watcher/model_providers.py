@@ -43,7 +43,11 @@ class HttpModelEvaluator(ABC):
         self._usage = ModelUsageStore(settings.results_file.parent / "model_usage.json")
 
     async def evaluate(self, ad: Ad) -> EvaluationResult:
-        prompt = build_evaluation_prompt(self._settings.marktplaats_use_case, ad)
+        prompt = build_evaluation_prompt(
+            self._settings.marktplaats_use_case,
+            ad,
+            include_image_content=self._settings.send_image_content_to_model,
+        )
         endpoint, headers, payload = self.request(prompt)
         reservation = self._usage.acquire()
         try:
@@ -94,7 +98,7 @@ class OpenAICompatibleEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         user_content: str | list[dict[str, Any]]
-        if self._settings.send_image_content_to_model and prompt.image_urls:
+        if prompt.image_urls:
             user_content = [{"type": "text", "text": prompt.user}]
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 user_content.append({"type": "image_url", "image_url": {"url": image_url}})
@@ -143,7 +147,7 @@ class OpenAIResponsesEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         input_content: str | list[dict[str, Any]]
-        if self._settings.send_image_content_to_model and prompt.image_urls:
+        if prompt.image_urls:
             input_content = [{"type": "input_text", "text": prompt.user}]
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 input_content.append(
@@ -220,7 +224,7 @@ class AnthropicMessagesEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         user_content: str | list[dict[str, Any]]
-        if self._settings.send_image_content_to_model and prompt.image_urls:
+        if prompt.image_urls:
             user_content = []
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 user_content.append(

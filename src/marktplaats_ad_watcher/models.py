@@ -15,6 +15,7 @@ class Ad(BaseModel):
     location: str | None = None
     seller: str | None = None
     image_urls: list[str] = Field(default_factory=list)
+    listing_facts: dict[str, str] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @field_validator("id", "title", "url")
@@ -25,7 +26,7 @@ class Ad(BaseModel):
             raise ValueError("Value must not be empty.")
         return stripped
 
-    def prompt_text(self) -> str:
+    def prompt_text(self, *, include_image_urls: bool = False) -> str:
         parts = [
             f"ID: {self.id}",
             f"Title: {self.title}",
@@ -40,7 +41,12 @@ class Ad(BaseModel):
             parts.append(f"Seller: {self.seller}")
         if self.description:
             parts.append(f"Description: {self.description}")
-        if self.image_urls:
+        if self.listing_facts:
+            facts = "\n".join(
+                f"{name}: {value}" for name, value in self.listing_facts.items()
+            )
+            parts.append(f"Listing facts:\n{facts}")
+        if include_image_urls and self.image_urls:
             parts.append("Image URLs:\n" + "\n".join(self.image_urls))
 
         return "\n".join(parts)
