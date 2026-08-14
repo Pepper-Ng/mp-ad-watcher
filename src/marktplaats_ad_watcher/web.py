@@ -30,7 +30,13 @@ from marktplaats_ad_watcher.model_config import (
 )
 from marktplaats_ad_watcher.model_providers import ModelProviderError, build_model_evaluator
 from marktplaats_ad_watcher.models import Ad, EvaluatedAd, WatcherRunSummary
+from marktplaats_ad_watcher.pipeline_progress import (
+    PipelineProgressRecord,
+    PipelineProgressStore,
+)
+from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
+from marktplaats_ad_watcher.telegram import TelegramNotifier
 from marktplaats_ad_watcher.usage import (
     ModelDailyLimitExceeded,
     ModelUsageSnapshot,
@@ -117,20 +123,26 @@ class RecentLogBuffer(logging.Handler):
         if record.exc_info and record.exc_info[1]:
             error = record.exc_info[1]
             message += f" — {type(error).__name__}: {error}"
-        message = re.sub(r"(?i)([?&]token=)[^&\s\"']+", r"\1[REDACTED]", message)
-        message = re.sub(
-            r"(?i)((?:authorization|password|api[_-]?key)\s*[:=]\s*)\S+",
-            r"\1[REDACTED]",
-            message,
-        )
+        message = _redact_diagnostic_text(message)
+        detail = _redact_diagnostic_text(str(getattr(record, "diagnostic_detail", "")))
         self.entries.append(
             {
                 "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": message[:1200],
+                "detail": detail[:8000],
             }
         )
+
+
+def _redact_diagnostic_text(value: str) -> str:
+    value = re.sub(r"(?i)([?&]token=)[^&\s\"']+", r"\1[REDACTED]", value)
+    return re.sub(
+        r"(?i)((?:authorization|password|token|api[_-]?key)\s*[:=]\s*)\S+",
+        r"\1[REDACTED]",
+        value,
+    )
 
 
 class WatcherService:
@@ -180,6 +192,17 @@ class WatcherService:
     def set_model_daily_limit(self, limit: int) -> ModelUsageSnapshot:
         return self.model_usage_store().set_limit(limit)
 
+    def reset_model_usage_today(self) -> ModelUsageSnapshot:
+        return self.model_usage_store().reset_today()
+
+    def pipeline_progress_store(self) -> PipelineProgressStore:
+        values = self.read_config()
+        results_file = Path(values["RESULTS_FILE"])
+        return PipelineProgressStore(results_file.parent / "pipeline_progress.json")
+
+    def pipeline_progress(self) -> list[PipelineProgressRecord]:
+        return self.pipeline_progress_store().list()
+
     @property
     def preview_ads(self) -> list[Ad]:
         if self._preview_fetched_at is None:
@@ -226,7 +249,30 @@ class WatcherService:
             raise ValueError("The preview expired or the selected ad is unavailable. Fetch again.")
         settings = self._load_settings()
         result = await build_model_evaluator(settings).evaluate(ad)
-        return EvaluatedAd(ad=ad, result=result)
+        evaluated_ad = EvaluatedAd(ad=ad, result=result)
+        seen_store = SeenStore(settings.state_file)
+        seen_store.append_result(settings.results_file, evaluated_ad)
+        seen_store.mark_seen(ad, result)
+        self.pipeline_progress_store().save_ai_result(evaluated_ad)
+        RuntimeStatusStore(settings.status_file).resolve_evaluation_failure(ad.id)
+        return evaluated_ad
+
+    async def send_pipeline_result_to_telegram(self, ad_id: str) -> PipelineProgressRecord:
+        record = self.pipeline_progress_store().get(ad_id)
+        if record is None:
+            raise ValueError("No saved AI result exists for this ad.")
+        send_result = await TelegramNotifier(self._load_settings()).send(record.evaluated_ad)
+        if not send_result.sent:
+            raise ValueError(send_result.reason or "Telegram did not send the result.")
+        return self.pipeline_progress_store().mark_telegram_sent(
+            ad_id,
+            message_id=send_result.message_id,
+        )
+
+    async def send_standalone_telegram_test(self) -> None:
+        send_result = await TelegramNotifier(self._load_settings()).send_test_message()
+        if not send_result.sent:
+            raise ValueError(send_result.reason or "Telegram connectivity test failed.")
 
     async def start(self) -> None:
         self._stopping = False
@@ -441,7 +487,6 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         *,
         notice: str | None = None,
         error: str | None = None,
-        test_result: EvaluatedAd | None = None,
     ) -> HTMLResponse:
         values = service.read_config()
         seen = _read_seen_ads(Path(values["STATE_FILE"]), kind="all")
@@ -457,6 +502,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             if summary
             else {}
         )
+        progress = service.pipeline_progress()
         body = f"""
         {_navigation(request, current="tools")}
         {_notice(notice, error=error)}
@@ -472,9 +518,23 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         </section>
         <section class="panel">
           <h2>Phase 2 · AI test</h2>
-          <p><strong>Test only.</strong> Sends one fetched ad to the configured model. The result
-          is not saved, the ad is not marked seen, and Telegram is not called.</p>
-          {_test_result(test_result)}
+                    <p>Sends one fetched ad to the configured model. A successful result is saved to
+          Evaluations, marks the ad processed, and clears its pending AI failure. Telegram is
+          not called automatically.</p>
+                    {_pipeline_progress_cards(request, progress)}
+                </section>
+                <section class="panel">
+                    <h2>Phase 3 · Telegram for a saved result</h2>
+                    <p>Each saved AI result has its own explicit Telegram action. No result means no
+                    per-ad Telegram action is available.</p>
+                    {_pipeline_telegram_actions(request, progress)}
+                </section>
+                <section class="panel">
+                    <h2>Standalone Telegram test</h2>
+                    <p>Sends a neutral connectivity message without an ad or AI result.</p>
+                    <form method="post" action="/tools/telegram-test{_token_query(request)}">
+                        <button type="submit">Send standalone Telegram test</button>
+                    </form>
         </section>
         <section class="panel full-run-panel">
           <h2>Full production run</h2>
@@ -518,9 +578,38 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             return tools_page(request, error=_safe_error("AI test failed", error))
         return tools_page(
             request,
-            notice="AI test completed. Nothing was saved and Telegram was not called.",
-            test_result=result,
+            notice=(
+                f"AI phase completed for {result.ad.title}. The result was saved and the ad is "
+                "now processed. Telegram was not called."
+            ),
         )
+
+    async def tools_telegram(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        ad_id = form.get("ad_id", [""])[0].strip()
+        try:
+            record = await service.send_pipeline_result_to_telegram(ad_id)
+        except Exception as error:
+            LOGGER.exception("Pipeline Telegram result test failed.")
+            return tools_page(request, error=_safe_error("Telegram test failed", error))
+        return tools_page(
+            request,
+            notice=f"Telegram sent for {record.evaluated_ad.ad.title} and delivery was recorded.",
+        )
+
+    async def tools_telegram_test(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        try:
+            await service.send_standalone_telegram_test()
+        except Exception as error:
+            LOGGER.exception("Standalone Telegram test failed.")
+            return tools_page(request, error=_safe_error("Telegram test failed", error))
+        return tools_page(request, notice="Standalone Telegram test message sent successfully.")
 
     async def full_run_confirm(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -566,14 +655,18 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         {_model_usage_panel(usage, request, compact=True)}
         <section class="panel">
           <h2>Change daily limit</h2>
-          <p>All production and manual AI attempts share this UTC-daily budget. Failed provider
-          requests count because they consumed an outbound attempt.</p>
-          <form method="post" action="/model-usage/limit{_token_query(request)}">
+          <p>All production and manual AI calls share this UTC-daily budget. Only successful
+          provider responses count as used; failed HTTP/network calls release their reservation.</p>
+                    <form class="model-limit-form" method="post"
+                        action="/model-usage/limit{_token_query(request)}">
             <label>Requests per UTC day
               <input type="number" name="limit" min="1" max="1000" value="{usage.limit}">
             </label>
             <button type="submit">Review limit change</button>
           </form>
+                    <p><a href="/model-usage/reset{_token_query(request)}">
+                        Reset today's usage…
+                    </a></p>
         </section>
         """
         return HTMLResponse(_page("Model request budget", body))
@@ -633,6 +726,36 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             )
         updated = service.set_model_daily_limit(new_limit)
         notice = f"Daily model request limit increased to {updated.limit} and is active now."
+        return RedirectResponse(
+            f"/model-usage{_query_with_values(request, notice=notice)}",
+            status_code=303,
+        )
+
+    async def model_usage_reset(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        usage = service.model_usage()
+        body = f"""
+        {_navigation(request, current="usage")}
+        <section class="panel full-run-panel">
+          <h2>Reset today's model usage?</h2>
+          <p>This changes usage from <strong>{usage.used}</strong> to <strong>0</strong> and
+          immediately restores the daily allowance. It does not change the limit.</p>
+          <form method="post" action="/model-usage/reset/apply{_token_query(request)}">
+            <button class="warning-button" type="submit">Confirm usage reset</button>
+            <a href="/model-usage{_token_query(request)}">Cancel</a>
+          </form>
+        </section>
+        """
+        return HTMLResponse(_page("Confirm usage reset", body))
+
+    async def model_usage_reset_apply(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        updated = service.reset_model_usage_today()
+        notice = f"Today's model usage was reset to {updated.used}/{updated.limit}."
         return RedirectResponse(
             f"/model-usage{_query_with_values(request, notice=notice)}",
             status_code=303,
@@ -842,11 +965,15 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/tools", tools),
             Route("/tools/fetch", tools_fetch, methods=["POST"]),
             Route("/tools/test", tools_test, methods=["POST"]),
+            Route("/tools/telegram", tools_telegram, methods=["POST"]),
+            Route("/tools/telegram-test", tools_telegram_test, methods=["POST"]),
             Route("/tools/full-run", full_run_confirm),
             Route("/diagnostics", diagnostics),
             Route("/model-usage", model_usage),
             Route("/model-usage/limit", model_usage_limit, methods=["POST"]),
             Route("/model-usage/limit/apply", model_usage_limit_apply, methods=["POST"]),
+            Route("/model-usage/reset", model_usage_reset),
+            Route("/model-usage/reset/apply", model_usage_reset_apply, methods=["POST"]),
             Route("/config", config_get, methods=["GET"]),
             Route("/config", config_post, methods=["POST"]),
             Route("/run-now", run_now, methods=["POST"]),
@@ -1007,6 +1134,11 @@ def _model_usage_panel(
         compact: bool = False,
 ) -> str:
         heading = "Model request budget" if not compact else "Model budget"
+        in_flight = (
+            f" {usage.in_flight} request(s) currently in flight."
+            if usage.in_flight
+            else ""
+        )
         return f"""
         <section class="panel usage-panel">
             <div class="section-heading">
@@ -1016,7 +1148,8 @@ def _model_usage_panel(
             <progress value="{usage.used}" max="{usage.limit}">
                 {usage.used} of {usage.limit}
             </progress>
-            <p>{usage.remaining} request(s) remaining. Resets {_format_time(usage.reset_at)}.
+            <p>{usage.remaining} request(s) remaining.{in_flight} Resets
+                {_format_time(usage.reset_at)}.
                 <a href="/model-usage{_token_query(request)}">Manage limit</a>
             </p>
         </section>
@@ -1232,13 +1365,59 @@ def _preview_ads_form(
     """
 
 
-def _test_result(result: EvaluatedAd | None) -> str:
-    if result is None:
-        return "<p class='hint'>Fetch ads and select one to test the configured model.</p>"
-    return (
-        "<p><span class='mini-badge'>Test only · not saved</span></p>"
-        + _evaluation_cards([result], test_only=True)
-    )
+def _pipeline_progress_cards(
+    request: Request,
+    records: list[PipelineProgressRecord],
+) -> str:
+    del request
+    if not records:
+        return "<p class='hint'>No saved manual AI results yet. Fetch ads and test one.</p>"
+    cards = []
+    for record in records:
+        telegram = (
+            f"Telegram sent {_format_time(record.telegram_sent_at)}"
+            if record.telegram_sent
+            else "Telegram not sent"
+        )
+        cards.append(
+            f"""
+            <div class="pipeline-progress">
+              <p class="badge-row">
+                <span class="mini-badge status-ok">AI complete · saved</span>
+                <span class="mini-badge">{telegram}</span>
+                <span class="hint">Tested {_format_time(record.tested_at)}</span>
+              </p>
+              {_evaluation_cards([record.evaluated_ad])}
+            </div>
+            """
+        )
+    return "".join(cards)
+
+
+def _pipeline_telegram_actions(
+    request: Request,
+    records: list[PipelineProgressRecord],
+) -> str:
+    if not records:
+        return "<p class='hint'>No saved AI result is available for Telegram.</p>"
+    forms = []
+    for record in records:
+        ad = record.evaluated_ad.ad
+        label = "Send again" if record.telegram_sent else "Send result"
+        forms.append(
+            f"""
+            <form class="telegram-result-action" method="post"
+              action="/tools/telegram{_token_query(request)}">
+              <input type="hidden" name="ad_id" value="{escape(ad.id)}">
+              <span><strong>{escape(ad.title)}</strong>
+                <span class="secondary">{escape(record.evaluated_ad.result.next_action)} ·
+                {record.evaluated_ad.result.confidence:.0%}</span>
+              </span>
+              <button type="submit">{label} via Telegram</button>
+            </form>
+            """
+        )
+    return "<div class='telegram-result-list'>" + "".join(forms) + "</div>"
 
 
 def _read_evaluations(path: Path, *, action: str) -> list[EvaluatedAd]:
@@ -1326,29 +1505,36 @@ def _evaluation_list(label: str, values: list[str]) -> str:
 
 
 def _recent_logs_table(entries: list[dict[str, str]]) -> str:
-        if not entries:
-                return "<p>No log messages have been captured since this container started.</p>"
-        rows = []
-        for entry in reversed(entries):
-                level = entry.get("level", "INFO").lower()
-                rows.append(
-                        f"""
-                        <tr>
-                            <td>{_format_time(entry.get('timestamp'))}</td>
-                            <td><span class="log-level log-{escape(level)}">
-                                {escape(level)}
-                            </span></td>
-                            <td>{escape(entry.get('logger', ''))}</td>
-                            <td class="log-message">{escape(entry.get('message', ''))}</td>
-                        </tr>
-                        """
-                )
-        return f"""
-        <div class="table-scroll"><table class="log-table">
-            <thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
-            <tbody>{''.join(rows)}</tbody>
-        </table></div>
-        """
+    if not entries:
+        return "<p>No log messages have been captured since this container started.</p>"
+    rows = []
+    for entry in reversed(entries):
+        level = entry.get("level", "INFO").lower()
+        detail = entry.get("detail", "")
+        rendered_message = escape(entry.get("message", ""))
+        if detail:
+            rendered_message += (
+                "<details class='diagnostic-detail'><summary>Show response</summary>"
+                f"<pre>{escape(detail)}</pre></details>"
+            )
+        rows.append(
+            f"""
+            <tr>
+              <td>{_format_time(entry.get('timestamp'))}</td>
+              <td><span class="log-level log-{escape(level)}">
+                {escape(level)}
+              </span></td>
+              <td>{escape(entry.get('logger', ''))}</td>
+              <td class="log-message">{rendered_message}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <div class="table-scroll"><table class="log-table">
+      <thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table></div>
+    """
 
 
 def _warning_for_missing_token(service: WatcherService) -> str:
@@ -1519,6 +1705,7 @@ def _page(title: str, body: str) -> str:
         .filter-form label {{ flex: 0 1 18rem; min-width: 12rem; }}
         .filter-form select {{ max-width: 18rem; }}
         input[type="number"] {{ max-width: 10rem; }}
+        .model-limit-form button {{ margin-top: 0.75rem; }}
         .evaluation-card {{
             border: 1px solid #d5d5d5;
             border-radius: 6px;
@@ -1546,6 +1733,12 @@ def _page(title: str, body: str) -> str:
             white-space: nowrap;
         }}
         .log-message {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+        .diagnostic-detail {{ margin-top: 0.45rem; }}
+        .diagnostic-detail pre {{
+            margin-bottom: 0;
+            overflow-wrap: anywhere;
+            white-space: pre-wrap;
+        }}
         .log-level {{
             border-radius: 1rem;
             font-size: 0.72rem;
@@ -1573,6 +1766,19 @@ def _page(title: str, body: str) -> str:
         .preview-card input {{ margin: 0.25rem 0.35rem 0 0; width: auto; }}
         .preview-content {{ display: grid; gap: 0.3rem; min-width: 0; }}
         .preview-heading {{ align-items: center; display: flex; flex-wrap: wrap; gap: 0.4rem; }}
+        .pipeline-progress {{ border-top: 1px solid #dfe3e7; margin-top: 1rem; padding-top: 1rem; }}
+        .telegram-result-list {{ display: grid; gap: 0.65rem; }}
+        .telegram-result-action {{
+            align-items: center;
+            background: #fafbfc;
+            border: 1px solid #dfe3e7;
+            border-radius: 6px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            justify-content: space-between;
+            padding: 0.75rem;
+        }}
         .full-run-panel {{ border-color: #d6ad58; }}
         .warning-button {{ background: #956500; border-color: #765000; }}
         .notice, .alert, .warning {{ border-radius: 5px; padding: 0.7rem; }}

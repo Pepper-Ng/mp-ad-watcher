@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import json
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from marktplaats_ad_watcher.models import EvaluatedAd
+
+_PROGRESS_LOCK = threading.Lock()
+
+
+class PipelineProgressRecord(BaseModel):
+    evaluated_ad: EvaluatedAd
+    tested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    telegram_sent: bool = False
+    telegram_sent_at: datetime | None = None
+    telegram_message_id: int | None = None
+
+
+class PipelineProgressStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def list(self) -> list[PipelineProgressRecord]:
+        with _PROGRESS_LOCK:
+            records = self._load()
+        return sorted(records.values(), key=lambda record: record.tested_at, reverse=True)
+
+    def get(self, ad_id: str) -> PipelineProgressRecord | None:
+        with _PROGRESS_LOCK:
+            return self._load().get(ad_id)
+
+    def save_ai_result(self, evaluated_ad: EvaluatedAd) -> PipelineProgressRecord:
+        with _PROGRESS_LOCK:
+            records = self._load()
+            record = PipelineProgressRecord(evaluated_ad=evaluated_ad)
+            records[evaluated_ad.ad.id] = record
+            self._save(records)
+            return record
+
+    def mark_telegram_sent(
+        self,
+        ad_id: str,
+        *,
+        message_id: int | None,
+    ) -> PipelineProgressRecord:
+        with _PROGRESS_LOCK:
+            records = self._load()
+            record = records.get(ad_id)
+            if record is None:
+                raise ValueError("No saved AI result exists for this ad.")
+            updated = record.model_copy(
+                update={
+                    "telegram_sent": True,
+                    "telegram_sent_at": datetime.now(UTC),
+                    "telegram_message_id": message_id,
+                }
+            )
+            records[ad_id] = updated
+            self._save(records)
+            return updated
+
+    def _load(self) -> dict[str, PipelineProgressRecord]:
+        if not self._path.exists():
+            return {}
+        try:
+            loaded: Any = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(loaded, dict):
+            return {}
+
+        raw_records = loaded.get("records", {})
+        if not isinstance(raw_records, dict):
+            return {}
+        records: dict[str, PipelineProgressRecord] = {}
+        for ad_id, value in raw_records.items():
+            try:
+                records[str(ad_id)] = PipelineProgressRecord.model_validate(value)
+            except (TypeError, ValueError):
+                continue
+        return records
+
+    def _save(self, records: dict[str, PipelineProgressRecord]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "records": {
+                ad_id: record.model_dump(mode="json") for ad_id, record in records.items()
+            }
+        }
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self._path)

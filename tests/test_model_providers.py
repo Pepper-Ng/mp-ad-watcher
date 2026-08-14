@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,7 @@ def test_anthropic_request_uses_native_headers_schema_and_images(tmp_path: Path)
 async def test_openai_compatible_evaluator_parses_valid_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -244,10 +246,13 @@ async def test_openai_compatible_evaluator_parses_valid_response(
             )
 
     monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    caplog.set_level(logging.INFO, logger="marktplaats_ad_watcher.model_providers")
     result = await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
 
     assert result.next_action == "notify"
     assert captured["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
+    details = [getattr(record, "diagnostic_detail", "") for record in caplog.records]
+    assert any('"next_action":"notify"' in detail for detail in details)
 
 
 @pytest.mark.asyncio
@@ -279,13 +284,17 @@ async def test_provider_http_error_exposes_safe_code_and_message(
             )
 
     monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    settings = _settings(tmp_path)
 
     with pytest.raises(ModelProviderError) as captured:
-        await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
+        await OpenAICompatibleEvaluator(settings).evaluate(_ad())
 
     assert captured.value.status_code == 429
     assert captured.value.code == "free_rate_limited"
     assert "Free model capacity is limited" in str(captured.value)
+    usage = ModelUsageStore(settings.results_file.parent / "model_usage.json").snapshot()
+    assert usage.used == 0
+    assert usage.in_flight == 0
 
 
 @pytest.mark.asyncio

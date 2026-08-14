@@ -13,12 +13,20 @@ class TelegramNotifier:
         self._settings = settings
 
     async def send(self, evaluated_ad: EvaluatedAd) -> TelegramSendResult:
+        return await self._send_text(_format_message(evaluated_ad))
+
+    async def send_test_message(self) -> TelegramSendResult:
+        return await self._send_text(
+            "<b>Marktplaats Ad Watcher test</b>\n"
+            "Telegram connectivity is configured and working."
+        )
+
+    async def _send_text(self, text: str) -> TelegramSendResult:
         token = self._settings.telegram_bot_token
         chat_id = self._settings.telegram_chat_id
         if not token or not chat_id:
             return TelegramSendResult(sent=False, reason="Telegram is not configured.")
 
-        text = _format_message(evaluated_ad)
         payload = {
             "chat_id": chat_id,
             "text": text,

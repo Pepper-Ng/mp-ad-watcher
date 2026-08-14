@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -17,6 +18,8 @@ from marktplaats_ad_watcher.evaluation import (
 from marktplaats_ad_watcher.model_config import ModelProtocol, provider_preset
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
 from marktplaats_ad_watcher.usage import ModelUsageStore
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ModelProviderError(RuntimeError):
@@ -42,23 +45,34 @@ class HttpModelEvaluator(ABC):
     async def evaluate(self, ad: Ad) -> EvaluationResult:
         prompt = build_evaluation_prompt(self._settings.marktplaats_use_case, ad)
         endpoint, headers, payload = self.request(prompt)
-        self._usage.reserve()
-        async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
-            response = await client.post(endpoint, headers=headers, json=payload)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                code, message = _provider_error_details(response)
-                raise ModelProviderError(
-                    status_code=response.status_code,
-                    code=code,
-                    message=message,
-                ) from error
+        reservation = self._usage.acquire()
+        try:
+            async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
+                response = await client.post(endpoint, headers=headers, json=payload)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as error:
+                    code, message = _provider_error_details(response)
+                    raise ModelProviderError(
+                        status_code=response.status_code,
+                        code=code,
+                        message=message,
+                    ) from error
+        except Exception:
+            reservation.release()
+            raise
+        reservation.commit()
 
         response_payload = response.json()
         if not isinstance(response_payload, dict):
             raise ValueError("Model response was not a JSON object at the protocol level.")
-        return parse_evaluation(self.response_text(response_payload))
+        response_text = self.response_text(response_payload)
+        LOGGER.info(
+            "Model response received for ad %s.",
+            ad.id,
+            extra={"diagnostic_detail": response_text[:8000]},
+        )
+        return parse_evaluation(response_text)
 
     @abstractmethod
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:

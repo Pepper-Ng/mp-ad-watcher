@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 _USAGE_LOCK = threading.Lock()
+_IN_FLIGHT: dict[str, int] = {}
 
 
 class ModelDailyLimitExceeded(RuntimeError):
@@ -26,10 +27,11 @@ class ModelUsageSnapshot:
     day: date
     used: int
     limit: int
+    in_flight: int = 0
 
     @property
     def remaining(self) -> int:
-        return max(0, self.limit - self.used)
+        return max(0, self.limit - self.used - self.in_flight)
 
     @property
     def reset_at(self) -> datetime:
@@ -42,6 +44,7 @@ class ModelUsageStore:
             raise ValueError("The default daily model request limit must be positive.")
         self._path = path
         self._default_limit = default_limit
+        self._key = str(path.resolve())
 
     def snapshot(self) -> ModelUsageSnapshot:
         with _USAGE_LOCK:
@@ -50,19 +53,22 @@ class ModelUsageStore:
             return self._snapshot(state)
 
     def reserve(self) -> ModelUsageSnapshot:
+        reservation = self.acquire()
+        return reservation.commit()
+
+    def acquire(self) -> ModelUsageReservation:
         with _USAGE_LOCK:
             state = self._load_current()
             snapshot = self._snapshot(state)
-            if snapshot.used >= snapshot.limit:
+            if snapshot.used + snapshot.in_flight >= snapshot.limit:
                 self._save(state)
                 raise ModelDailyLimitExceeded(
                     used=snapshot.used,
                     limit=snapshot.limit,
                     reset_at=snapshot.reset_at,
                 )
-            state["used"] = snapshot.used + 1
-            self._save(state)
-            return self._snapshot(state)
+            _IN_FLIGHT[self._key] = snapshot.in_flight + 1
+            return ModelUsageReservation(self)
 
     def set_limit(self, limit: int) -> ModelUsageSnapshot:
         if limit < 1 or limit > 1000:
@@ -71,6 +77,26 @@ class ModelUsageStore:
             state = self._load_current()
             state["limit"] = limit
             self._save(state)
+            return self._snapshot(state)
+
+    def reset_today(self) -> ModelUsageSnapshot:
+        with _USAGE_LOCK:
+            state = self._load_current()
+            state["used"] = 0
+            self._save(state)
+            return self._snapshot(state)
+
+    def _finish(self, *, success: bool) -> ModelUsageSnapshot:
+        with _USAGE_LOCK:
+            in_flight = _IN_FLIGHT.get(self._key, 0)
+            if in_flight > 1:
+                _IN_FLIGHT[self._key] = in_flight - 1
+            else:
+                _IN_FLIGHT.pop(self._key, None)
+            state = self._load_current()
+            if success:
+                state["used"] = int(state["used"]) + 1
+                self._save(state)
             return self._snapshot(state)
 
     def _load_current(self) -> dict[str, Any]:
@@ -101,10 +127,28 @@ class ModelUsageStore:
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self._path)
 
-    @staticmethod
-    def _snapshot(state: dict[str, Any]) -> ModelUsageSnapshot:
+    def _snapshot(self, state: dict[str, Any]) -> ModelUsageSnapshot:
         return ModelUsageSnapshot(
             day=date.fromisoformat(str(state["day"])),
             used=int(state["used"]),
             limit=int(state["limit"]),
+            in_flight=_IN_FLIGHT.get(self._key, 0),
         )
+
+
+class ModelUsageReservation:
+    def __init__(self, store: ModelUsageStore) -> None:
+        self._store = store
+        self._active = True
+
+    def commit(self) -> ModelUsageSnapshot:
+        if not self._active:
+            raise RuntimeError("This model usage reservation is already closed.")
+        self._active = False
+        return self._store._finish(success=True)
+
+    def release(self) -> ModelUsageSnapshot:
+        if not self._active:
+            raise RuntimeError("This model usage reservation is already closed.")
+        self._active = False
+        return self._store._finish(success=False)

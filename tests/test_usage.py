@@ -40,6 +40,32 @@ def test_model_usage_limit_is_enforced_and_increase_applies_immediately(tmp_path
     assert after_increase.limit == 2
 
 
+def test_failed_model_reservation_releases_without_counting(tmp_path: Path) -> None:
+    path = tmp_path / "model_usage.json"
+    store = ModelUsageStore(path)
+
+    reservation = store.acquire()
+    during = store.snapshot()
+    after = reservation.release()
+
+    assert during.used == 0
+    assert during.in_flight == 1
+    assert after.used == 0
+    assert after.in_flight == 0
+
+
+def test_model_usage_can_be_reset_for_current_day(tmp_path: Path) -> None:
+    path = tmp_path / "model_usage.json"
+    store = ModelUsageStore(path)
+    store.reserve()
+    store.reserve()
+
+    reset = store.reset_today()
+
+    assert reset.used == 0
+    assert reset.limit == 30
+
+
 def test_model_usage_reservations_are_structurally_serialized(tmp_path: Path) -> None:
     path = tmp_path / "model_usage.json"
     ModelUsageStore(path).set_limit(5)

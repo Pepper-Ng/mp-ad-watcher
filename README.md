@@ -84,16 +84,19 @@ Run with the small web UI:
 Open `http://127.0.0.1:8080/?token=<WEB_ADMIN_TOKEN>` when `WEB_ADMIN_TOKEN` is set.
 The dashboard shows formatted run status and activity totals. Protected pages provide evaluation
 history with decision filtering and JSON download, seen-ad history with baseline reasons, and
-pipeline tools for fetching current ads and testing one ad with AI without changing state or
-sending Telegram. A full production run remains a separate confirmed action. The configuration
+staged pipeline tools. Fetch preview changes no state. A successful manual AI phase persists the
+interpreted evaluation, marks that ad processed, and clears its current AI failure without sending
+Telegram. Saved results expose explicit per-result Telegram actions; a standalone connectivity test
+is also available. A full production run remains a separate confirmed action. The configuration
 page edits the poll interval, prompt, model settings, and API keys. Existing API keys are never
 shown; leaving a secret field blank keeps the current value, except that changing providers clears
 the previous provider key. Failed AI evaluations remain pending for retry and are shown with safe
 provider error details. A protected diagnostics page keeps a bounded, token-redacted view of recent
 application logs; complete container output remains available through Portainer. Production and
-manual AI tests share a persistent UTC-daily request budget of 30 by default. The UI shows usage,
-remaining requests, and reset time; increasing the budget requires a separate confirmation and is
-enforced immediately through the shared quota file.
+manual AI tests share a persistent UTC-daily request budget of 30 successful responses by default.
+Failed HTTP/network attempts release their reservation and do not count. The UI shows usage,
+remaining requests, in-flight reservations, and reset time; increasing or resetting the budget
+requires confirmation and applies immediately through the shared quota file.
 
 ## Model providers
 

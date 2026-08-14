@@ -15,10 +15,12 @@ from marktplaats_ad_watcher.models import (
     EvaluatedAd,
     EvaluationFailure,
     EvaluationResult,
+    TelegramSendResult,
     WatcherRunSummary,
 )
+from marktplaats_ad_watcher.pipeline_progress import PipelineProgressStore
 from marktplaats_ad_watcher.state import SeenStore
-from marktplaats_ad_watcher.status import RuntimeStatus
+from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
 from marktplaats_ad_watcher.usage import ModelUsageStore
 from marktplaats_ad_watcher.web import (
     ERROR_RETRY_SECONDS,
@@ -496,6 +498,24 @@ def test_recent_log_buffer_redacts_admin_tokens() -> None:
     assert "token=[REDACTED]" in buffer.entries[0]["message"]
 
 
+def test_recent_log_buffer_retains_redacted_response_detail() -> None:
+    buffer = RecentLogBuffer()
+    logger = logging.getLogger("test.model.response")
+    logger.addHandler(buffer)
+    logger.setLevel(logging.INFO)
+    try:
+        logger.info(
+            "Model response received.",
+            extra={"diagnostic_detail": '{"result":"ok"} token=secret'},
+        )
+    finally:
+        logger.removeHandler(buffer)
+
+    assert len(buffer.entries) == 1
+    assert '"result":"ok"' in buffer.entries[0]["detail"]
+    assert "secret" not in buffer.entries[0]["detail"]
+
+
 @pytest.mark.asyncio
 async def test_model_budget_increase_requires_confirmation_and_applies_immediately(
     tmp_path: Path,
@@ -527,6 +547,11 @@ async def test_model_budget_increase_requires_confirmation_and_applies_immediate
             data={"limit": "40"},
             follow_redirects=False,
         )
+        reset_confirmation = await client.get("/model-usage/reset?token=admin-token")
+        reset = await client.post(
+            "/model-usage/reset/apply?token=admin-token",
+            follow_redirects=False,
+        )
 
     assert denied.status_code == 401
     assert page.status_code == 200
@@ -534,7 +559,11 @@ async def test_model_budget_increase_requires_confirmation_and_applies_immediate
     assert "Confirm increased model budget" in confirmation.text
     assert before_apply.limit == 30
     assert applied.status_code == 303
-    assert ModelUsageStore(usage_file).snapshot().limit == 40
+    assert "Reset today's model usage?" in reset_confirmation.text
+    assert reset.status_code == 303
+    final_usage = ModelUsageStore(usage_file).snapshot()
+    assert final_usage.limit == 40
+    assert final_usage.used == 0
 
 
 @pytest.mark.asyncio
@@ -583,7 +612,7 @@ async def test_seen_ads_page_explains_and_filters_baseline_ads(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
+async def test_pipeline_ai_phase_persists_and_advances_without_telegram(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,6 +624,8 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
         env_file,
         {
             "WEB_ADMIN_TOKEN": "admin-token",
+            "MARKTPLAATS_SEARCH_URL": "https://www.marktplaats.nl/lrp/api/search?query=test",
+            "MARKTPLAATS_USE_CASE": "Find freezer chests.",
             "STATE_FILE": str(state_file),
             "RESULTS_FILE": str(results_file),
             "STATUS_FILE": str(status_file),
@@ -636,22 +667,22 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
         self._preview_counts = (2, 1, 1)
         return [preview_ad]
 
-    async def fake_test_preview(self: WatcherService, ad_id: str) -> EvaluatedAd:
-        del self
-        assert ad_id == preview_ad.id
-        return EvaluatedAd(
-            ad=preview_ad,
-            result=EvaluationResult(
+    class FakeEvaluator:
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            assert ad.id == preview_ad.id
+            return EvaluationResult(
                 relevant=True,
                 confidence=0.8,
                 reason="Promising dimensions.",
                 signals=["Chest freezer"],
                 next_action="review",
-            ),
-        )
+            )
 
     monkeypatch.setattr(WatcherService, "fetch_preview", fake_fetch_preview)
-    monkeypatch.setattr(WatcherService, "test_preview_ad", fake_test_preview)
+    monkeypatch.setattr(
+        "marktplaats_ad_watcher.web.build_model_evaluator",
+        lambda _: FakeEvaluator(),
+    )
     app = create_web_app(env_file=env_file, dry_run=True)
     transport = httpx.ASGITransport(app=app)
 
@@ -673,11 +704,89 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
     assert 'class="secondary failure-detail"' in fetched.text
     assert "grid-template-columns: auto minmax(0, 1fr)" in fetched.text
     assert "overflow-wrap: anywhere" in fetched.text
+    assert "Send result via Telegram" not in fetched.text
     assert tested.status_code == 200
-    assert "Test only" in tested.text
+    assert "AI phase completed for Preview freezer" in tested.text
+    assert "AI complete · saved" in tested.text
+    assert "Telegram not sent" in tested.text
+    assert "Send result via Telegram" in tested.text
     assert "Promising dimensions." in tested.text
-    assert not state_file.exists()
-    assert not results_file.exists()
+    assert SeenStore(state_file).has_seen(preview_ad.id)
+    assert '"reason":"Promising dimensions."' in results_file.read_text(encoding="utf-8")
+    progress = PipelineProgressStore(tmp_path / "pipeline_progress.json").get(preview_ad.id)
+    assert progress is not None
+    assert progress.telegram_sent is False
+    summary = RuntimeStatusStore(status_file).read().last_summary
+    assert summary is not None
+    assert summary.evaluation_failed_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_telegram_phases_are_explicit_and_record_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    results_file = tmp_path / "evaluations.jsonl"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "MARKTPLAATS_SEARCH_URL": "https://www.marktplaats.nl/lrp/api/search?query=test",
+            "MARKTPLAATS_USE_CASE": "Find freezer chests.",
+            "RESULTS_FILE": str(results_file),
+        },
+    )
+    evaluated = EvaluatedAd(
+        ad=Ad(id="m1", title="Saved freezer", url="https://www.marktplaats.nl/v/m1"),
+        result=EvaluationResult(
+            relevant=True,
+            confidence=0.9,
+            reason="Good size.",
+            next_action="notify",
+        ),
+    )
+    progress_store = PipelineProgressStore(tmp_path / "pipeline_progress.json")
+    progress_store.save_ai_result(evaluated)
+    sent_ids: list[str] = []
+    standalone_calls = 0
+
+    async def fake_send(notifier: object, value: EvaluatedAd) -> TelegramSendResult:
+        del notifier
+        sent_ids.append(value.ad.id)
+        return TelegramSendResult(sent=True, message_id=42)
+
+    async def fake_standalone(notifier: object) -> TelegramSendResult:
+        nonlocal standalone_calls
+        del notifier
+        standalone_calls += 1
+        return TelegramSendResult(sent=True, message_id=43)
+
+    monkeypatch.setattr("marktplaats_ad_watcher.web.TelegramNotifier.send", fake_send)
+    monkeypatch.setattr(
+        "marktplaats_ad_watcher.web.TelegramNotifier.send_test_message",
+        fake_standalone,
+    )
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        result_send = await client.post(
+            "/tools/telegram?token=admin-token",
+            data={"ad_id": "m1"},
+        )
+        standalone = await client.post("/tools/telegram-test?token=admin-token")
+
+    assert result_send.status_code == 200
+    assert "delivery was recorded" in result_send.text
+    assert standalone.status_code == 200
+    assert "Standalone Telegram test message sent" in standalone.text
+    assert sent_ids == ["m1"]
+    assert standalone_calls == 1
+    progress = PipelineProgressStore(tmp_path / "pipeline_progress.json").get("m1")
+    assert progress is not None
+    assert progress.telegram_sent is True
+    assert progress.telegram_message_id == 42
 
 
 @pytest.mark.asyncio

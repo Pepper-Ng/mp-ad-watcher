@@ -74,6 +74,18 @@ class RuntimeStatusStore:
         self._status.next_run_at = value
         self._touch()
 
+    def resolve_evaluation_failure(self, ad_id: str) -> bool:
+        summary = self._status.last_summary
+        if summary is None:
+            return False
+        remaining = [failure for failure in summary.evaluation_failures if failure.ad_id != ad_id]
+        if len(remaining) == len(summary.evaluation_failures):
+            return False
+        summary.evaluation_failures = remaining
+        summary.evaluation_failed_count = len(remaining)
+        self._touch()
+        return True
+
     def _load(self) -> RuntimeStatus:
         if not self._path.exists():
             return RuntimeStatus()
