@@ -88,7 +88,9 @@ pipeline tools for fetching current ads and testing one ad with AI without chang
 sending Telegram. A full production run remains a separate confirmed action. The configuration
 page edits the poll interval, prompt, model settings, and API keys. Existing API keys are never
 shown; leaving a secret field blank keeps the current value, except that changing providers clears
-the previous provider key.
+the previous provider key. Failed AI evaluations remain pending for retry and are shown with safe
+provider error details. A protected diagnostics page keeps a bounded, token-redacted view of recent
+application logs; complete container output remains available through Portainer.
 
 ## Model providers
 

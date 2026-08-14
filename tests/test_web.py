@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -17,7 +18,12 @@ from marktplaats_ad_watcher.models import (
 )
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatus
-from marktplaats_ad_watcher.web import ERROR_RETRY_SECONDS, WatcherService, create_web_app
+from marktplaats_ad_watcher.web import (
+    ERROR_RETRY_SECONDS,
+    RecentLogBuffer,
+    WatcherService,
+    create_web_app,
+)
 
 
 @pytest.mark.asyncio
@@ -428,6 +434,67 @@ async def test_dashboard_formats_last_summary_as_pipeline(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_dashboard_explains_failed_ai_attempt(tmp_path: Path) -> None:
+    env_file = tmp_path / "settings.env"
+    status_file = tmp_path / "status.json"
+    write_dotenv(
+        env_file,
+        {"WEB_ADMIN_TOKEN": "admin-token", "STATUS_FILE": str(status_file)},
+    )
+    status = RuntimeStatus(
+        last_finished_at=datetime.now(UTC),
+        last_summary=WatcherRunSummary(
+            fetched_count=1,
+            kept_count=1,
+            filtered_count=0,
+            new_count=1,
+            evaluated_count=0,
+            notified_count=0,
+            evaluation_failed_count=1,
+            evaluation_failures=[
+                {
+                    "ad_id": "m1",
+                    "title": "Pending freezer",
+                    "url": "https://www.marktplaats.nl/v/m1",
+                    "error": "ModelProviderError: HTTP 429 (free_rate_limited)",
+                }
+            ],
+        ),
+    )
+    status_file.write_text(status.model_dump_json(indent=2), encoding="utf-8")
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        page = await client.get("/?token=admin-token")
+        diagnostics_denied = await client.get("/diagnostics")
+        diagnostics = await client.get("/diagnostics?token=admin-token")
+
+    assert "Needs attention" in page.text
+    assert "AI failed 1" in page.text
+    assert "Pending freezer" in page.text
+    assert "remains pending" in page.text
+    assert diagnostics_denied.status_code == 401
+    assert diagnostics.status_code == 200
+    assert "Recent watcher logs" in diagnostics.text
+
+
+def test_recent_log_buffer_redacts_admin_tokens() -> None:
+    buffer = RecentLogBuffer()
+    logger = logging.getLogger("test.recent.logs")
+    logger.addHandler(buffer)
+    logger.setLevel(logging.INFO)
+    try:
+        logger.info('GET /tools?token=very-secret-token&action=all HTTP/1.1')
+    finally:
+        logger.removeHandler(buffer)
+
+    assert len(buffer.entries) == 1
+    assert "very-secret-token" not in buffer.entries[0]["message"]
+    assert "token=[REDACTED]" in buffer.entries[0]["message"]
+
+
+@pytest.mark.asyncio
 async def test_seen_ads_page_explains_and_filters_baseline_ads(tmp_path: Path) -> None:
     env_file = tmp_path / "settings.env"
     state_file = tmp_path / "seen_ads.json"
@@ -480,12 +547,14 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
     env_file = tmp_path / "settings.env"
     state_file = tmp_path / "seen_ads.json"
     results_file = tmp_path / "evaluations.jsonl"
+    status_file = tmp_path / "status.json"
     write_dotenv(
         env_file,
         {
             "WEB_ADMIN_TOKEN": "admin-token",
             "STATE_FILE": str(state_file),
             "RESULTS_FILE": str(results_file),
+            "STATUS_FILE": str(status_file),
         },
     )
     preview_ad = Ad(
@@ -494,6 +563,28 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
         url="https://www.marktplaats.nl/v/m-preview",
         price="EUR 100.00",
         location="Weert",
+    )
+    status_file.write_text(
+        RuntimeStatus(
+            last_summary=WatcherRunSummary(
+                fetched_count=1,
+                kept_count=1,
+                filtered_count=0,
+                new_count=1,
+                evaluated_count=0,
+                notified_count=0,
+                evaluation_failed_count=1,
+                evaluation_failures=[
+                    {
+                        "ad_id": preview_ad.id,
+                        "title": preview_ad.title,
+                        "url": preview_ad.url,
+                        "error": "ModelProviderError: free_rate_limited",
+                    }
+                ],
+            )
+        ).model_dump_json(),
+        encoding="utf-8",
     )
 
     async def fake_fetch_preview(self: WatcherService) -> list[Ad]:
@@ -532,6 +623,8 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
     assert fetched.status_code == 200
     assert "Preview freezer" in fetched.text
     assert "2</strong> fetched" in fetched.text
+    assert "AI failed · pending" in fetched.text
+    assert "free_rate_limited" in fetched.text
     assert tested.status_code == 200
     assert "Test only" in tested.text
     assert "Promising dimensions." in tested.text

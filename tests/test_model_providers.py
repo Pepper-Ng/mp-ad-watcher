@@ -11,6 +11,7 @@ from marktplaats_ad_watcher.config import Settings
 from marktplaats_ad_watcher.evaluation import build_evaluation_prompt
 from marktplaats_ad_watcher.model_providers import (
     AnthropicMessagesEvaluator,
+    ModelProviderError,
     OpenAICompatibleEvaluator,
     OpenAIResponsesEvaluator,
     build_model_evaluator,
@@ -246,6 +247,44 @@ async def test_openai_compatible_evaluator_parses_valid_response(
 
     assert result.next_action == "notify"
     assert captured["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_provider_http_error_exposes_safe_code_and_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "error": {
+                        "code": "free_rate_limited",
+                        "message": "Free model capacity is limited right now.",
+                    }
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+
+    with pytest.raises(ModelProviderError) as captured:
+        await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
+
+    assert captured.value.status_code == 429
+    assert captured.value.code == "free_rate_limited"
+    assert "Free model capacity is limited" in str(captured.value)
 
 
 def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> None:

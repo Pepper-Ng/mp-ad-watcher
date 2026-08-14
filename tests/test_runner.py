@@ -10,6 +10,7 @@ from marktplaats_ad_watcher.config import Settings
 from marktplaats_ad_watcher.models import Ad, EvaluationResult, TelegramSendResult
 from marktplaats_ad_watcher.runner import Watcher
 from marktplaats_ad_watcher.state import SeenStore
+from marktplaats_ad_watcher.status import RuntimeStatusStore
 
 
 class FakeMarktplaatsClient:
@@ -179,3 +180,37 @@ async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: P
     assert first_summary.notified_count == 0
     assert second_summary.new_count == 0
     assert evaluator.evaluated_ids == ["m123"]
+
+
+@pytest.mark.asyncio
+async def test_evaluation_failure_remains_pending_and_is_reported(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class FailingEvaluator:
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            del ad
+            raise RuntimeError("Model provider returned HTTP 429 (free_rate_limited).")
+
+    status_store = RuntimeStatusStore(settings.status_file)
+    store = SeenStore(settings.state_file)
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=FakeMarktplaatsClient(
+            [Ad(id="m-pending", title="Pending freezer", url="https://example.test/pending")]
+        ),
+        evaluator=FailingEvaluator(),
+        notifier=FakeNotifier(),
+        store=store,
+        status_store=status_store,
+    )
+
+    summary = await watcher.run_once()
+
+    assert summary.new_count == 1
+    assert summary.evaluated_count == 0
+    assert summary.evaluation_failed_count == 1
+    assert summary.evaluation_failures[0].ad_id == "m-pending"
+    assert "free_rate_limited" in summary.evaluation_failures[0].error
+    assert not store.has_seen("m-pending")
+    status = RuntimeStatusStore(settings.status_file).read()
+    assert status.total_evaluation_failed == 1

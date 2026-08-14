@@ -18,6 +18,14 @@ from marktplaats_ad_watcher.model_config import ModelProtocol, provider_preset
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
 
 
+class ModelProviderError(RuntimeError):
+    def __init__(self, *, status_code: int, code: str | None, message: str) -> None:
+        self.status_code = status_code
+        self.code = code
+        code_text = f" ({code})" if code else ""
+        super().__init__(f"Model provider returned HTTP {status_code}{code_text}: {message}")
+
+
 class ProviderAdapter(Protocol):
     async def evaluate(self, ad: Ad) -> EvaluationResult: ...
 
@@ -34,7 +42,15 @@ class HttpModelEvaluator(ABC):
         endpoint, headers, payload = self.request(prompt)
         async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                code, message = _provider_error_details(response)
+                raise ModelProviderError(
+                    status_code=response.status_code,
+                    code=code,
+                    message=message,
+                ) from error
 
         response_payload = response.json()
         if not isinstance(response_payload, dict):
@@ -256,3 +272,22 @@ def build_model_evaluator(settings: Settings) -> Evaluator:
 
 def _endpoint(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _provider_error_details(response: httpx.Response) -> tuple[str | None, str]:
+    code: str | None = None
+    message = response.reason_phrase or "Request failed."
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            raw_code = error.get("code")
+            raw_message = error.get("message")
+            if isinstance(raw_code, str) and raw_code.strip():
+                code = raw_code.strip()
+            if isinstance(raw_message, str) and raw_message.strip():
+                message = raw_message.strip()
+    return code, message[:500]

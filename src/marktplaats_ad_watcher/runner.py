@@ -9,6 +9,7 @@ from marktplaats_ad_watcher.evaluation import Evaluator
 from marktplaats_ad_watcher.models import (
     Ad,
     EvaluatedAd,
+    EvaluationFailure,
     EvaluationResult,
     TelegramSendResult,
     WatcherRunSummary,
@@ -97,12 +98,21 @@ class Watcher:
         ignored_count = 0
         review_count = 0
         notify_action_count = 0
+        evaluation_failures: list[EvaluationFailure] = []
 
         for ad in new_ads:
             try:
                 result = await self._evaluator.evaluate(ad)
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("Failed to evaluate ad %s (%s).", ad.id, ad.title)
+                evaluation_failures.append(
+                    EvaluationFailure(
+                        ad_id=ad.id,
+                        title=ad.title,
+                        url=ad.url,
+                        error=_evaluation_failure_message(error),
+                    )
+                )
                 continue
 
             evaluated_ad = EvaluatedAd(ad=ad, result=result)
@@ -164,6 +174,8 @@ class Watcher:
             ignored_count=ignored_count,
             review_count=review_count,
             notify_action_count=notify_action_count,
+            evaluation_failed_count=len(evaluation_failures),
+            evaluation_failures=evaluation_failures,
         )
 
     async def run_loop(self) -> None:
@@ -198,3 +210,8 @@ def _filter_ads(ads: list[Ad], *, exclude_admarkt_ads: bool) -> list[Ad]:
         return ads
 
     return [ad for ad in ads if not ad.id.lower().startswith("a")]
+
+
+def _evaluation_failure_message(error: Exception) -> str:
+    message = str(error).strip() or "No error details were supplied."
+    return f"{type(error).__name__}: {message}"[:600]

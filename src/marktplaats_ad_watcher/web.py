@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from collections import deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -26,7 +28,7 @@ from marktplaats_ad_watcher.model_config import (
     provider_preset,
     resolved_model_environment,
 )
-from marktplaats_ad_watcher.model_providers import build_model_evaluator
+from marktplaats_ad_watcher.model_providers import ModelProviderError, build_model_evaluator
 from marktplaats_ad_watcher.models import Ad, EvaluatedAd, WatcherRunSummary
 from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
 
@@ -98,6 +100,32 @@ CONFIG_DEFAULTS = {
 LOGGER = logging.getLogger(__name__)
 ERROR_RETRY_SECONDS = 60
 DEPLOYMENT_ENV_KEYS = {"WEB_ADMIN_TOKEN"}
+
+
+class RecentLogBuffer(logging.Handler):
+    def __init__(self, *, maximum: int = 200) -> None:
+        super().__init__(level=logging.INFO)
+        self.entries: deque[dict[str, str]] = deque(maxlen=maximum)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if record.exc_info and record.exc_info[1]:
+            error = record.exc_info[1]
+            message += f" — {type(error).__name__}: {error}"
+        message = re.sub(r"(?i)([?&]token=)[^&\s\"']+", r"\1[REDACTED]", message)
+        message = re.sub(
+            r"(?i)((?:authorization|password|api[_-]?key)\s*[:=]\s*)\S+",
+            r"\1[REDACTED]",
+            message,
+        )
+        self.entries.append(
+            {
+                "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": message[:1200],
+            }
+        )
 
 
 class WatcherService:
@@ -256,14 +284,18 @@ class WatcherService:
 
 def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
     service = WatcherService(env_file=env_file, dry_run=dry_run)
+    recent_logs = RecentLogBuffer()
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
+        root_logger = logging.getLogger()
+        root_logger.addHandler(recent_logs)
         await service.start()
         try:
             yield
         finally:
             await service.stop()
+            root_logger.removeHandler(recent_logs)
 
     async def index(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -282,6 +314,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                         {_metric("Runs", status.total_runs)}
                         {_metric("Errors", status.total_errors)}
                         {_metric("Evaluated", status.total_evaluated)}
+                        {_metric("AI failed", status.total_evaluation_failed)}
                         {_metric("Telegram sent", status.total_notified)}
                     </div>
                     <details>
@@ -290,7 +323,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                             {_row("Fetched results", status.total_fetched)}
                             {_row("Kept after filters", status.total_kept)}
                             {_row("Filtered locally", status.total_filtered)}
-                            {_row("New ads", status.total_new)}
+                              {_row("New-ad attempts", status.total_new)}
+                              {_row("AI evaluation failures", status.total_evaluation_failed)}
                             {_row("Model ignored", status.total_ignored)}
                             {_row("Model review", status.total_reviewed)}
                             {_row("Model notify", status.total_notify_actions)}
@@ -378,6 +412,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           </form>
           <p>{len(entries)} seen ad(s). Baseline ads were present when tracking started and
           intentionally skipped AI evaluation.</p>
+          <p class="hint">A currently new ad appears here only after its production AI evaluation
+          succeeds. Failed ads remain pending, stay off this page, and retry on later runs.</p>
           {_seen_ads_table(entries)}
         </section>
         """
@@ -393,6 +429,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         values = service.read_config()
         seen = _read_seen_ads(Path(values["STATE_FILE"]), kind="all")
         seen_by_id = {str(entry["id"]): entry for entry in seen}
+        summary = service.status_store().read().last_summary
+        failures_by_id = (
+            {failure.ad_id: failure.error for failure in summary.evaluation_failures}
+            if summary
+            else {}
+        )
         body = f"""
         {_navigation(request, current="tools")}
         {_notice(notice, error=error)}
@@ -403,7 +445,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             <button type="submit">Fetch current ads</button>
           </form>
           {_preview_summary(service)}
-          {_preview_ads_form(request, service.preview_ads, seen_by_id)}
+          {_preview_ads_form(request, service.preview_ads, seen_by_id, failures_by_id)}
         </section>
         <section class="panel">
           <h2>Phase 2 · AI test</h2>
@@ -473,6 +515,21 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         </section>
         """
         return HTMLResponse(_page("Confirm full run", body))
+
+    async def diagnostics(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        body = f"""
+        {_navigation(request, current="diagnostics")}
+        <section class="panel">
+          <h2>Recent watcher logs</h2>
+          <p>Shows the latest in-process messages since this container started. For complete Docker
+          output, open Portainer → Containers → marktplaats-ad-watcher → Logs.</p>
+          {_recent_logs_table(list(recent_logs.entries))}
+        </section>
+        """
+        return HTMLResponse(_page("Diagnostics", body))
 
     async def config_get(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -679,6 +736,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/tools/fetch", tools_fetch, methods=["POST"]),
             Route("/tools/test", tools_test, methods=["POST"]),
             Route("/tools/full-run", full_run_confirm),
+            Route("/diagnostics", diagnostics),
             Route("/config", config_get, methods=["GET"]),
             Route("/config", config_post, methods=["POST"]),
             Route("/run-now", run_now, methods=["POST"]),
@@ -726,6 +784,7 @@ def _navigation(request: Request, *, current: str) -> str:
         ("evaluations", "/evaluations", "Evaluations"),
         ("seen", "/seen", "Seen ads"),
         ("tools", "/tools", "Pipeline tools"),
+        ("diagnostics", "/diagnostics", "Diagnostics"),
         ("config", "/config", "Configuration"),
     ]
     links = []
@@ -736,7 +795,10 @@ def _navigation(request: Request, *, current: str) -> str:
 
 
 def _status_panel(status: RuntimeStatus) -> str:
-    if status.last_error:
+    has_evaluation_failures = bool(
+        status.last_summary and status.last_summary.evaluation_failed_count
+    )
+    if status.last_error or has_evaluation_failures:
         state, css_class = "Needs attention", "status-error"
     elif status.is_running:
         state, css_class = "Running", "status-running"
@@ -779,6 +841,7 @@ def _last_run_panel(summary: WatcherRunSummary | None) -> str:
         if summary.bootstrapped_count
         else ""
     )
+    failures = _evaluation_failures(summary)
     return f"""
     <section class="panel">
       <h2>Last run</h2>
@@ -793,11 +856,30 @@ def _last_run_panel(summary: WatcherRunSummary | None) -> str:
         <span class="mini-badge decision-notify">Notify {summary.notify_action_count}</span>
         <span class="mini-badge decision-review">Review {summary.review_count}</span>
         <span class="mini-badge decision-ignore">Ignore {summary.ignored_count}</span>
+                <span class="mini-badge status-error">
+                    AI failed {summary.evaluation_failed_count}
+                </span>
         <span class="mini-badge">Telegram {summary.notified_count}</span>
         {baseline}
       </div>
+            {failures}
     </section>
     """
+
+
+def _evaluation_failures(summary: WatcherRunSummary) -> str:
+        if not summary.evaluation_failures:
+                return ""
+        items = "".join(
+                f"<li><a href='{escape(failure.url)}' target='_blank' rel='noopener noreferrer'>"
+                f"{escape(failure.title)}</a>: {escape(failure.error)}. "
+                "The ad remains pending and will retry on the next production run.</li>"
+                for failure in summary.evaluation_failures
+        )
+        return (
+            "<div class='alert' role='alert'><strong>AI evaluation failures</strong>"
+            f"<ul>{items}</ul></div>"
+        )
 
 
 def _metric(label: str, value: int) -> str:
@@ -827,7 +909,7 @@ def _notice(message: str | None, *, error: str | None = None) -> str:
 
 
 def _safe_error(prefix: str, error: Exception) -> str:
-    if isinstance(error, ValueError):
+    if isinstance(error, ValueError | ModelProviderError):
         return f"{prefix}: {error}"
     return f"{prefix}. Check the watcher logs for technical details and try again."
 
@@ -942,6 +1024,7 @@ def _preview_ads_form(
     request: Request,
     ads: list[Ad],
     seen_by_id: Mapping[str, Mapping[str, Any]],
+    failures_by_id: Mapping[str, str],
 ) -> str:
     if not ads:
         return ""
@@ -951,8 +1034,19 @@ def _preview_ads_form(
         if seen_entry:
             kind = _seen_kind(seen_entry)
             state = f"<span class='seen-badge seen-{kind}'>{kind}</span>"
+            state_detail = ""
+        elif ad.id in failures_by_id:
+            state = "<span class='seen-badge status-error'>AI failed · pending</span>"
+            state_detail = (
+                f"<span class='secondary failure-detail'>{escape(failures_by_id[ad.id])}. "
+                "The production watcher will retry this ad.</span>"
+            )
         else:
-            state = "<span class='seen-badge status-running'>new</span>"
+            state = "<span class='seen-badge status-running'>new · pending</span>"
+            state_detail = (
+                "<span class='secondary'>Not in seen state; production evaluation has not "
+                "completed yet.</span>"
+            )
         details = " · ".join(value for value in [ad.price, ad.location, ad.seller] if value)
         display_details = escape(details) if details else "No price, location, or seller supplied."
         cards.append(
@@ -967,6 +1061,7 @@ def _preview_ads_form(
               <span class="secondary">ID {escape(ad.id)} · {len(ad.image_urls)} image(s) ·
                 <a href="{escape(ad.url)}" target="_blank" rel="noopener noreferrer">Open ad</a>
               </span>
+                            {state_detail}
             </label>
             """
         )
@@ -1072,6 +1167,32 @@ def _evaluation_list(label: str, values: list[str]) -> str:
         return ""
     items = "".join(f"<li>{escape(value)}</li>" for value in values)
     return f"<p><strong>{escape(label)}:</strong></p><ul>{items}</ul>"
+
+
+def _recent_logs_table(entries: list[dict[str, str]]) -> str:
+        if not entries:
+                return "<p>No log messages have been captured since this container started.</p>"
+        rows = []
+        for entry in reversed(entries):
+                level = entry.get("level", "INFO").lower()
+                rows.append(
+                        f"""
+                        <tr>
+                            <td>{_format_time(entry.get('timestamp'))}</td>
+                            <td><span class="log-level log-{escape(level)}">
+                                {escape(level)}
+                            </span></td>
+                            <td>{escape(entry.get('logger', ''))}</td>
+                            <td class="log-message">{escape(entry.get('message', ''))}</td>
+                        </tr>
+                        """
+                )
+        return f"""
+        <div class="table-scroll"><table class="log-table">
+            <thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table></div>
+        """
 
 
 def _warning_for_missing_token(service: WatcherService) -> str:
@@ -1194,7 +1315,11 @@ def _page(title: str, body: str) -> str:
             gap: 0.55rem;
         }}
         .mini-badge {{ background: #e8eaed; color: #30343a; }}
-        .metric-grid {{ display: grid; gap: 0.7rem; grid-template-columns: repeat(4, 1fr); }}
+        .metric-grid {{
+            display: grid;
+            gap: 0.7rem;
+            grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+        }}
         .metric {{ background: #f7f8fa; border-radius: 5px; padding: 0.8rem; }}
         .metric strong {{ display: block; font-size: 1.45rem; }}
         .metric span {{ color: #555; font-size: 0.85rem; }}
@@ -1255,7 +1380,19 @@ def _page(title: str, body: str) -> str:
         .decision-ignore {{ background: #5a5a5a; }}
         .table-scroll {{ overflow-x: auto; }}
         .history-table {{ min-width: 720px; }}
+        .log-table {{ min-width: 850px; }}
+        .log-message {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+        .log-level {{
+            border-radius: 1rem;
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 0.18rem 0.45rem;
+        }}
+        .log-error, .log-critical {{ background: #f7dddd; color: #8a2020; }}
+        .log-warning {{ background: #fff0ca; color: #765000; }}
+        .log-info, .log-debug {{ background: #e8eaed; color: #4f5358; }}
         .secondary {{ color: #5f646a; display: block; font-size: 0.82rem; margin-top: 0.25rem; }}
+        .failure-detail {{ color: #8a2020; }}
         .preview-list {{ display: grid; gap: 0.55rem; margin: 1rem 0; }}
         .preview-card {{
             align-items: start;

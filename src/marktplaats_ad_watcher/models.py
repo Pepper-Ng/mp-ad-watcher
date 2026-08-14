@@ -75,6 +75,13 @@ class TelegramSendResult(BaseModel):
     message_id: int | None = None
 
 
+class EvaluationFailure(BaseModel):
+    ad_id: str
+    title: str
+    url: str
+    error: str
+
+
 class WatcherRunSummary(BaseModel):
     fetched_count: int
     kept_count: int
@@ -86,6 +93,8 @@ class WatcherRunSummary(BaseModel):
     review_count: int = 0
     notify_action_count: int = 0
     bootstrapped_count: int = 0
+    evaluation_failed_count: int = 0
+    evaluation_failures: list[EvaluationFailure] = Field(default_factory=list)
 
 
 class SearchHealth(BaseModel):

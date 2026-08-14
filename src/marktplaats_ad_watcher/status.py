@@ -28,6 +28,7 @@ class RuntimeStatus(BaseModel):
     total_ignored: int = 0
     total_reviewed: int = 0
     total_notify_actions: int = 0
+    total_evaluation_failed: int = 0
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -59,6 +60,7 @@ class RuntimeStatusStore:
         self._status.total_ignored += summary.ignored_count
         self._status.total_reviewed += summary.review_count
         self._status.total_notify_actions += summary.notify_action_count
+        self._status.total_evaluation_failed += summary.evaluation_failed_count
         self._touch()
 
     def mark_failed(self, error: Exception) -> None:
