@@ -4,7 +4,7 @@ import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -16,7 +16,8 @@ _PROGRESS_LOCK = threading.Lock()
 class PipelineProgressRecord(BaseModel):
     evaluated_ad: EvaluatedAd
     tested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    telegram_sent: bool = False
+    source: Literal["manual_test", "production"] = "manual_test"
+    telegram_sent: bool | None = False
     telegram_sent_at: datetime | None = None
     telegram_message_id: int | None = None
 
@@ -37,7 +38,7 @@ class PipelineProgressStore:
     def save_ai_result(self, evaluated_ad: EvaluatedAd) -> PipelineProgressRecord:
         with _PROGRESS_LOCK:
             records = self._load()
-            record = PipelineProgressRecord(evaluated_ad=evaluated_ad)
+            record = PipelineProgressRecord(evaluated_ad=evaluated_ad, source="manual_test")
             records[evaluated_ad.ad.id] = record
             self._save(records)
             return record
@@ -63,6 +64,32 @@ class PipelineProgressStore:
             records[ad_id] = updated
             self._save(records)
             return updated
+
+    def sync_evaluations(self, path: Path) -> list[PipelineProgressRecord]:
+        if not path.exists():
+            return self.list()
+        with _PROGRESS_LOCK:
+            records = self._load()
+            changed = False
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    evaluated_ad = EvaluatedAd.model_validate_json(line)
+                except ValueError:
+                    continue
+                if evaluated_ad.ad.id in records:
+                    continue
+                records[evaluated_ad.ad.id] = PipelineProgressRecord(
+                    evaluated_ad=evaluated_ad,
+                    tested_at=evaluated_ad.evaluated_at,
+                    source="production",
+                    telegram_sent=None,
+                )
+                changed = True
+            if changed:
+                self._save(records)
+        return sorted(records.values(), key=lambda record: record.tested_at, reverse=True)
 
     def _load(self) -> dict[str, PipelineProgressRecord]:
         if not self._path.exists():

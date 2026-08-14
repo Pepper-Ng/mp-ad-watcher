@@ -201,7 +201,8 @@ class WatcherService:
         return PipelineProgressStore(results_file.parent / "pipeline_progress.json")
 
     def pipeline_progress(self) -> list[PipelineProgressRecord]:
-        return self.pipeline_progress_store().list()
+        values = self.read_config()
+        return self.pipeline_progress_store().sync_evaluations(Path(values["RESULTS_FILE"]))
 
     @property
     def preview_ads(self) -> list[Ad]:
@@ -258,6 +259,7 @@ class WatcherService:
         return evaluated_ad
 
     async def send_pipeline_result_to_telegram(self, ad_id: str) -> PipelineProgressRecord:
+        self.pipeline_progress()
         record = self.pipeline_progress_store().get(ad_id)
         if record is None:
             raise ValueError("No saved AI result exists for this ad.")
@@ -1374,16 +1376,19 @@ def _pipeline_progress_cards(
         return "<p class='hint'>No saved manual AI results yet. Fetch ads and test one.</p>"
     cards = []
     for record in records:
-        telegram = (
-            f"Telegram sent {_format_time(record.telegram_sent_at)}"
-            if record.telegram_sent
-            else "Telegram not sent"
-        )
+        if record.telegram_sent is True:
+            telegram = f"Telegram sent {_format_time(record.telegram_sent_at)}"
+        elif record.telegram_sent is False:
+            telegram = "Telegram not sent"
+        else:
+            telegram = "Telegram delivery not tracked by test pipeline"
+        source = "Manual AI test" if record.source == "manual_test" else "Production evaluation"
         cards.append(
             f"""
             <div class="pipeline-progress">
               <p class="badge-row">
                 <span class="mini-badge status-ok">AI complete · saved</span>
+                <span class="mini-badge">{source}</span>
                 <span class="mini-badge">{telegram}</span>
                 <span class="hint">Tested {_format_time(record.tested_at)}</span>
               </p>
@@ -1403,7 +1408,7 @@ def _pipeline_telegram_actions(
     forms = []
     for record in records:
         ad = record.evaluated_ad.ad
-        label = "Send again" if record.telegram_sent else "Send result"
+        label = "Send again" if record.telegram_sent is True else "Send result"
         forms.append(
             f"""
             <form class="telegram-result-action" method="post"

@@ -48,3 +48,16 @@ def test_saving_new_ai_result_resets_telegram_progress(tmp_path: Path) -> None:
 
     assert replaced.telegram_sent is False
     assert replaced.telegram_message_id is None
+
+
+def test_pipeline_progress_imports_production_evaluations(tmp_path: Path) -> None:
+    progress_path = tmp_path / "pipeline_progress.json"
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text(_evaluated_ad().model_dump_json() + "\n", encoding="utf-8")
+
+    records = PipelineProgressStore(progress_path).sync_evaluations(evaluations_path)
+
+    assert len(records) == 1
+    assert records[0].source == "production"
+    assert records[0].telegram_sent is None
+    assert records[0].evaluated_ad.ad.id == "m1"

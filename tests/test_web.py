@@ -790,6 +790,42 @@ async def test_pipeline_telegram_phases_are_explicit_and_record_delivery(
 
 
 @pytest.mark.asyncio
+async def test_production_evaluation_is_available_for_explicit_telegram_phase(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    results_file = tmp_path / "evaluations.jsonl"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "RESULTS_FILE": str(results_file),
+        },
+    )
+    evaluated = EvaluatedAd(
+        ad=Ad(id="m1", title="Production freezer", url="https://www.marktplaats.nl/v/m1"),
+        result=EvaluationResult(
+            relevant=False,
+            confidence=0.6,
+            reason="Needs dimensions.",
+            next_action="review",
+        ),
+    )
+    results_file.write_text(evaluated.model_dump_json() + "\n", encoding="utf-8")
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        page = await client.get("/tools?token=admin-token")
+
+    assert page.status_code == 200
+    assert "Production freezer" in page.text
+    assert "Production evaluation" in page.text
+    assert "Telegram delivery not tracked by test pipeline" in page.text
+    assert "Send result via Telegram" in page.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider", "reasoning", "temperature", "saved_reasoning", "saved_temperature"),
     [
