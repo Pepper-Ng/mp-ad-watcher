@@ -1190,7 +1190,7 @@ def _preview_ads_form(
         elif ad.id in failures_by_id:
             state = "<span class='seen-badge status-error'>AI failed · pending</span>"
             state_detail = (
-                f"<span class='secondary failure-detail'>{escape(failures_by_id[ad.id])}. "
+                f'<span class="secondary failure-detail">{escape(failures_by_id[ad.id])}. '
                 "The production watcher will retry this ad.</span>"
             )
         else:
@@ -1206,14 +1206,18 @@ def _preview_ads_form(
             <label class="preview-card">
               <input type="radio" name="ad_id" value="{escape(ad.id)}"
                 {'checked' if index == 0 else ''}>
-              <span><strong>{escape(ad.title)}</strong> {state}</span>
-                            <span>
-                                {display_details}
-                            </span>
-              <span class="secondary">ID {escape(ad.id)} · {len(ad.image_urls)} image(s) ·
-                <a href="{escape(ad.url)}" target="_blank" rel="noopener noreferrer">Open ad</a>
+                            <span class="preview-content">
+                                <span class="preview-heading">
+                                    <strong>{escape(ad.title)}</strong> {state}
+                                </span>
+                                <span>{display_details}</span>
+                                <span class="secondary">
+                                    ID {escape(ad.id)} · {len(ad.image_urls)} image(s) ·
+                                    <a href="{escape(ad.url)}" target="_blank"
+                                        rel="noopener noreferrer">Open ad</a>
+                                </span>
+                                {state_detail}
               </span>
-                            {state_detail}
             </label>
             """
         )
@@ -1552,7 +1556,7 @@ def _page(title: str, body: str) -> str:
         .log-warning {{ background: #fff0ca; color: #765000; }}
         .log-info, .log-debug {{ background: #e8eaed; color: #4f5358; }}
         .secondary {{ color: #5f646a; display: block; font-size: 0.82rem; margin-top: 0.25rem; }}
-        .failure-detail {{ color: #8a2020; }}
+        .failure-detail {{ color: #8a2020; overflow-wrap: anywhere; word-break: break-word; }}
         .usage-panel progress {{ height: 0.85rem; width: 100%; }}
         .usage-panel p {{ margin-bottom: 0; }}
         .preview-list {{ display: grid; gap: 0.55rem; margin: 1rem 0; }}
@@ -1563,10 +1567,12 @@ def _page(title: str, body: str) -> str:
             border-radius: 6px;
             display: grid;
             gap: 0.3rem;
-            grid-template-columns: auto 1fr;
+            grid-template-columns: auto minmax(0, 1fr);
             padding: 0.75rem;
         }}
-        .preview-card input {{ grid-row: 1 / 4; margin: 0.25rem 0.35rem 0 0; width: auto; }}
+        .preview-card input {{ margin: 0.25rem 0.35rem 0 0; width: auto; }}
+        .preview-content {{ display: grid; gap: 0.3rem; min-width: 0; }}
+        .preview-heading {{ align-items: center; display: flex; flex-wrap: wrap; gap: 0.4rem; }}
         .full-run-panel {{ border-color: #d6ad58; }}
         .warning-button {{ background: #956500; border-color: #765000; }}
         .notice, .alert, .warning {{ border-radius: 5px; padding: 0.7rem; }}

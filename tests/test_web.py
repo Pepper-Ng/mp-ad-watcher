@@ -669,6 +669,10 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
     assert "2</strong> fetched" in fetched.text
     assert "AI failed · pending" in fetched.text
     assert "free_rate_limited" in fetched.text
+    assert 'class="preview-content"' in fetched.text
+    assert 'class="secondary failure-detail"' in fetched.text
+    assert "grid-template-columns: auto minmax(0, 1fr)" in fetched.text
+    assert "overflow-wrap: anywhere" in fetched.text
     assert tested.status_code == 200
     assert "Test only" in tested.text
     assert "Promising dimensions." in tested.text
