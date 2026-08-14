@@ -189,6 +189,7 @@ class Watcher:
         self._notifier = notifier
         self._store = store
         self._status_store = status_store
+        self._profile_log_context = _watcher_profile_log_context(settings)
 
     async def run_once(self) -> WatcherRunSummary:
         if self._status_store is not None:
@@ -211,11 +212,19 @@ class Watcher:
             self._settings.marktplaats_search_url,
             limit=self._settings.max_ads_per_poll,
         )
-        LOGGER.info("Fetched %s ads from Marktplaats.", len(fetched_ads))
+        LOGGER.info(
+            "%sFetched %s ads from Marktplaats.",
+            self._profile_log_context,
+            len(fetched_ads),
+        )
 
         ads = _filter_ads(fetched_ads, exclude_admarkt_ads=self._settings.exclude_admarkt_ads)
         filtered_count = len(fetched_ads) - len(ads)
-        LOGGER.info("Kept %s ads after local filters.", len(ads))
+        LOGGER.info(
+            "%sKept %s ads after local filters.",
+            self._profile_log_context,
+            len(ads),
+        )
 
         if (
             self._store.is_empty
@@ -223,7 +232,11 @@ class Watcher:
             and not self._settings.dry_run
         ):
             self._store.mark_many_seen(ads)
-            LOGGER.info("Bootstrapped %s existing ads as already seen.", len(ads))
+            LOGGER.info(
+                "%sBootstrapped %s existing ads as already seen.",
+                self._profile_log_context,
+                len(ads),
+            )
             return WatcherRunSummary(
                 fetched_count=len(fetched_ads),
                 kept_count=len(ads),
@@ -235,7 +248,7 @@ class Watcher:
             )
 
         new_ads = [ad for ad in ads if not self._store.has_seen(ad.id)]
-        LOGGER.info("Found %s new ads.", len(new_ads))
+        LOGGER.info("%sFound %s new ads.", self._profile_log_context, len(new_ads))
 
         evaluated_count = 0
         notified_count = 0
@@ -249,7 +262,10 @@ class Watcher:
                 enriched_ad = await self._enrich_ad(ad)
             except Exception as error:
                 LOGGER.exception(
-                    "Failed to load full listing details for ad %s (%s).", ad.id, ad.title
+                    "%sFailed to load full listing details for ad %s (%s).",
+                    self._profile_log_context,
+                    ad.id,
+                    ad.title,
                 )
                 evaluation_failures.append(
                     EvaluationFailure(
@@ -265,7 +281,10 @@ class Watcher:
                 result = await self._evaluator.evaluate(enriched_ad)
             except Exception as error:
                 LOGGER.exception(
-                    "Failed to evaluate ad %s (%s).", enriched_ad.id, enriched_ad.title
+                    "%sFailed to evaluate ad %s (%s).",
+                    self._profile_log_context,
+                    enriched_ad.id,
+                    enriched_ad.title,
                 )
                 evaluation_failures.append(
                     EvaluationFailure(
@@ -291,7 +310,8 @@ class Watcher:
             elif result.next_action == "notify":
                 notify_action_count += 1
             LOGGER.info(
-                "Evaluation for %s: relevant=%s confidence=%.2f action=%s",
+                "%sEvaluation for %s: relevant=%s confidence=%.2f action=%s",
+                self._profile_log_context,
                 ad.id,
                 result.relevant,
                 result.confidence,
@@ -308,22 +328,35 @@ class Watcher:
                 notify_review_actions=self._settings.notify_review_actions,
             ):
                 if self._settings.dry_run:
-                    LOGGER.info("Dry run: would notify for ad %s.", ad.id)
+                    LOGGER.info(
+                        "%sDry run: would notify for ad %s.",
+                        self._profile_log_context,
+                        ad.id,
+                    )
                 else:
                     try:
                         send_result = await self._notifier.send(evaluated_ad)
                     except Exception:
                         LOGGER.exception(
-                            "Telegram notification failed for ad %s; the evaluation was retained.",
+                            (
+                                "%sTelegram notification failed for ad %s; "
+                                "the evaluation was retained."
+                            ),
+                            self._profile_log_context,
                             ad.id,
                         )
                     else:
                         if send_result.sent:
                             notified_count += 1
-                            LOGGER.info("Sent Telegram notification for ad %s.", ad.id)
+                            LOGGER.info(
+                                "%sSent Telegram notification for ad %s.",
+                                self._profile_log_context,
+                                ad.id,
+                            )
                         else:
                             LOGGER.info(
-                                "Skipped Telegram notification for ad %s: %s.",
+                                "%sSkipped Telegram notification for ad %s: %s.",
+                                self._profile_log_context,
                                 ad.id,
                                 send_result.reason,
                             )
@@ -352,9 +385,13 @@ class Watcher:
         while True:
             try:
                 summary = await self.run_once()
-                LOGGER.info("Run summary: %s", summary.model_dump())
+                LOGGER.info(
+                    "%sRun summary: %s",
+                    self._profile_log_context,
+                    summary.model_dump(),
+                )
             except Exception:
-                LOGGER.exception("Watcher run failed.")
+                LOGGER.exception("%sWatcher run failed.", self._profile_log_context)
 
             await asyncio.sleep(self._settings.poll_interval_seconds)
 
@@ -399,3 +436,15 @@ def _set_next_run_at(status_store: RuntimeStatusStore, value: datetime) -> datet
 def _profile_error_message(error: Exception) -> str:
     message = str(error).strip() or "No error details were supplied."
     return f"{type(error).__name__}: {message}"[:600]
+
+
+def _watcher_profile_log_context(settings: Settings) -> str:
+    profile_name = settings.active_profile_name
+    profile_id = settings.active_profile_id
+    if profile_name and profile_id:
+        return f"[{profile_name} · {profile_id}] "
+    if profile_name:
+        return f"[{profile_name}] "
+    if profile_id:
+        return f"[{profile_id}] "
+    return ""

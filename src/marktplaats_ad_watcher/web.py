@@ -40,6 +40,7 @@ from marktplaats_ad_watcher.pipeline_progress import (
 from marktplaats_ad_watcher.profiles import (
     DEFAULT_PROFILE_ID,
     ProfileConfigurationError,
+    ProfileMigrationError,
     ProfileRegistry,
     ProfileRegistryStore,
     SearchProfile,
@@ -230,7 +231,7 @@ class WatcherService:
         try:
             registry = self.activate_profile_registry()
         except ValueError as error:
-            if not str(error).startswith("Missing required environment variable MARKTPLAATS_"):
+            if not _is_missing_search_settings_error(error):
                 raise
             if requested_profile_id and requested_profile_id not in {DEFAULT_PROFILE_ID, "freezers"}:
                 raise ValueError("Profiles are unavailable until search settings are configured.") from error
@@ -251,7 +252,7 @@ class WatcherService:
         try:
             return self.activate_profile_registry().active_profiles
         except ValueError as error:
-            if str(error).startswith("Missing required environment variable MARKTPLAATS_"):
+            if _is_missing_search_settings_error(error):
                 return ()
             raise
 
@@ -259,9 +260,7 @@ class WatcherService:
         try:
             settings = self._load_settings()
         except ValueError as error:
-            if profile is not None or not str(error).startswith(
-                "Missing required environment variable MARKTPLAATS_"
-            ):
+            if profile is not None or not _is_missing_search_settings_error(error):
                 raise
             values = self.read_config()
             values.setdefault(
@@ -419,17 +418,25 @@ class WatcherService:
         ad_id: str,
         profile: SearchProfile | None = None,
     ) -> PipelineProgressRecord:
-        self.pipeline_progress_for(profile)
+        settings = self.settings_for_profile(profile)
         progress_store = self.pipeline_progress_store_for(profile)
+        progress_store.sync_evaluations(settings.results_file)
         record = progress_store.get(ad_id)
         if record is None:
             raise ValueError("No saved AI result exists for this ad.")
-        send_result = await TelegramNotifier(self.settings_for_profile(profile)).send(record.evaluated_ad)
+        evaluated_ad = _evaluation_with_profile_defaults(
+            record.evaluated_ad,
+            profile_id=settings.active_profile_id,
+            profile_name=settings.active_profile_name,
+        )
+        send_result = await TelegramNotifier(settings).send(evaluated_ad)
         if not send_result.sent:
             raise ValueError(send_result.reason or "Telegram did not send the result.")
         return progress_store.mark_telegram_sent(
             ad_id,
             message_id=send_result.message_id,
+            profile_id=evaluated_ad.profile_id,
+            profile_name=evaluated_ad.profile_name,
         )
 
     async def send_standalone_telegram_test(self, profile: SearchProfile | None = None) -> None:
@@ -439,7 +446,17 @@ class WatcherService:
 
     async def start(self) -> None:
         self._stopping = False
-        self.activate_profile_registry()
+        try:
+            self.activate_profile_registry()
+        except ValueError as error:
+            if _is_missing_search_settings_error(error):
+                LOGGER.info(
+                    "Watcher startup is paused until Marktplaats search settings are configured."
+                )
+            else:
+                LOGGER.info("Watcher startup is paused: %s", error)
+        except (ProfileConfigurationError, ProfileMigrationError):
+            LOGGER.exception("Watcher startup detected an inconsistent profile migration state.")
         self._stop_event = asyncio.Event()
         self._loop_task = asyncio.create_task(self._run_forever())
 
@@ -696,6 +713,30 @@ def _profile_progress_records(
     ]
 
 
+def _evaluation_with_profile_defaults(
+    evaluated_ad: EvaluatedAd,
+    *,
+    profile_id: str | None,
+    profile_name: str | None,
+) -> EvaluatedAd:
+    updates: dict[str, str] = {}
+    if evaluated_ad.profile_id is None and profile_id is not None:
+        updates["profile_id"] = profile_id
+    if evaluated_ad.profile_name is None and profile_name is not None:
+        updates["profile_name"] = profile_name
+    return evaluated_ad.model_copy(update=updates) if updates else evaluated_ad
+
+
+def _is_missing_search_settings_error(error: Exception) -> bool:
+    return str(error).startswith("Missing required environment variable MARKTPLAATS_")
+
+
+def _profile_log_context(profile: SearchProfile | None) -> str:
+    if profile is None:
+        return "[legacy]"
+    return f"[{profile.name} · {profile.id}]"
+
+
 def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
     service = WatcherService(env_file=env_file, dry_run=dry_run)
     recent_logs = RecentLogBuffer()
@@ -790,6 +831,24 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         )
 
     async def health(_: Request) -> PlainTextResponse:
+        try:
+            settings = service._load_settings()
+        except ValueError as error:
+            if _is_missing_search_settings_error(error):
+                return PlainTextResponse(
+                    "ok (paused: waiting for Marktplaats search configuration)"
+                )
+            return PlainTextResponse("ok (paused)")
+
+        try:
+            ensure_profile_registry(settings)
+            verify_profile_registry(settings)
+        except (ProfileConfigurationError, ProfileMigrationError) as error:
+            LOGGER.error(
+                "Health check detected inconsistent profile migration state: %s",
+                error,
+            )
+            return PlainTextResponse("not ok: profile migration inconsistent", status_code=503)
         return PlainTextResponse("ok")
 
     async def evaluations(request: Request) -> HTMLResponse:
@@ -1000,7 +1059,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             else:
                 await service.fetch_preview()
         except Exception as error:
-            LOGGER.exception("Pipeline fetch preview failed.")
+            LOGGER.exception("%s Pipeline fetch preview failed.", _profile_log_context(selection.profile))
             return tools_page(request, selection, error=_safe_error("Fetch failed", error))
         return tools_page(
             request,
@@ -1020,7 +1079,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         try:
             result = await service.test_preview_ad(ad_id, selection.profile)
         except Exception as error:
-            LOGGER.exception("Pipeline AI preview failed.")
+            LOGGER.exception("%s Pipeline AI preview failed.", _profile_log_context(selection.profile))
             return tools_page(request, selection, error=_safe_error("AI test failed", error))
         return tools_page(
             request,
@@ -1043,7 +1102,10 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         try:
             record = await service.send_pipeline_result_to_telegram(ad_id, selection.profile)
         except Exception as error:
-            LOGGER.exception("Pipeline Telegram result test failed.")
+            LOGGER.exception(
+                "%s Pipeline Telegram result test failed.",
+                _profile_log_context(selection.profile),
+            )
             return tools_page(request, selection, error=_safe_error("Telegram test failed", error))
         return tools_page(
             request,
@@ -1061,7 +1123,10 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         try:
             await service.send_standalone_telegram_test(selection.profile)
         except Exception as error:
-            LOGGER.exception("Standalone Telegram test failed.")
+            LOGGER.exception(
+                "%s Standalone Telegram test failed.",
+                _profile_log_context(selection.profile),
+            )
             return tools_page(request, selection, error=_safe_error("Telegram test failed", error))
         return tools_page(
             request,

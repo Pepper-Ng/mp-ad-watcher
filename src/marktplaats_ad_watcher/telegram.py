@@ -13,11 +13,22 @@ class TelegramNotifier:
         self._settings = settings
 
     async def send(self, evaluated_ad: EvaluatedAd) -> TelegramSendResult:
-        return await self._send_text(_format_message(evaluated_ad))
+        return await self._send_text(
+            _format_message(
+                evaluated_ad,
+                fallback_profile_id=self._settings.active_profile_id,
+                fallback_profile_name=self._settings.active_profile_name,
+            )
+        )
 
     async def send_test_message(self) -> TelegramSendResult:
+        heading = _message_heading(
+            "Marktplaats Ad Watcher test",
+            profile_id=self._settings.active_profile_id,
+            profile_name=self._settings.active_profile_name,
+        )
         return await self._send_text(
-            "<b>Marktplaats Ad Watcher test</b>\n"
+            f"<b>{escape(heading)}</b>\n"
             "Telegram connectivity is configured and working."
         )
 
@@ -44,16 +55,24 @@ class TelegramNotifier:
         return TelegramSendResult(sent=True, message_id=message_id)
 
 
-def _format_message(evaluated_ad: EvaluatedAd) -> str:
+def _format_message(
+    evaluated_ad: EvaluatedAd,
+    *,
+    fallback_profile_id: str | None = None,
+    fallback_profile_name: str | None = None,
+) -> str:
     ad = evaluated_ad.ad
     result = evaluated_ad.result
-    heading = (
+    raw_heading = (
         "Likely Marktplaats match"
         if result.next_action == "notify"
         else "Check Marktplaats specs"
     )
+    profile_id = evaluated_ad.profile_id or fallback_profile_id
+    profile_name = evaluated_ad.profile_name or fallback_profile_name
+    heading = _message_heading(raw_heading, profile_id=profile_id, profile_name=profile_name)
     lines = [
-        f"<b>{heading}</b>",
+        f"<b>{escape(heading)}</b>",
         f'<a href="{escape(ad.url)}">{escape(ad.title)}</a>',
     ]
 
@@ -78,3 +97,20 @@ def _format_message(evaluated_ad: EvaluatedAd) -> str:
         lines.append("Concerns: " + escape("; ".join(result.concerns[:3])))
 
     return "\n".join(lines)
+
+
+def _message_heading(base_heading: str, *, profile_id: str | None, profile_name: str | None) -> str:
+    label = _profile_label(profile_id=profile_id, profile_name=profile_name)
+    return f"{label} {base_heading}" if label else base_heading
+
+
+def _profile_label(*, profile_id: str | None, profile_name: str | None) -> str | None:
+    normalized_id = profile_id.strip() if isinstance(profile_id, str) else ""
+    normalized_name = profile_name.strip() if isinstance(profile_name, str) else ""
+    if normalized_name and normalized_id:
+        return f"[{normalized_name} · {normalized_id}]"
+    if normalized_name:
+        return f"[{normalized_name}]"
+    if normalized_id:
+        return f"[{normalized_id}]"
+    return None

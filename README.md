@@ -90,7 +90,9 @@ history with decision filtering and JSON download, seen-ad history with baseline
 staged pipeline tools. Fetch preview changes no state. A successful manual AI phase persists the
 interpreted evaluation, marks that ad processed, and clears its current AI failure without sending
 Telegram. Saved results expose explicit per-result Telegram actions; a standalone connectivity test
-is also available. A full production run remains a separate confirmed action. The configuration
+is also available. In profile-aware mode, production notifications, per-result sends, and
+standalone test messages include a profile heading label such as `[Freezers · freezers]`; labels
+are HTML-escaped before sending. A full production run remains a separate confirmed action. The configuration
 page edits the poll interval, prompt, model settings, and API keys. Existing API keys are never
 shown; leaving a secret field blank keeps the current value, except that changing providers clears
 the previous provider key. Failed AI evaluations remain pending for retry and are shown with safe
@@ -149,6 +151,10 @@ By default, both `notify` and `review` model actions trigger Telegram. The messa
 - `review`: check specs.
 - `ignore`: no Telegram message.
 
+When a profile is selected, the heading is prefixed with a visible profile label such as
+`[Freezers · freezers]`. Profile labels are HTML-escaped. Legacy records with no profile metadata
+retain the legacy heading when no active profile context is available.
+
 Tune this with:
 
 ```env
@@ -196,9 +202,14 @@ Each evaluated ad is appended to `data/evaluations.jsonl` with this structure:
     "concerns": ["missing detail"],
     "next_action": "notify"
   },
-  "evaluated_at": "2026-07-24T12:00:00Z"
+  "evaluated_at": "2026-07-24T12:00:00Z",
+  "profile_id": "freezers",
+  "profile_name": "Freezers"
 }
 ```
+
+`profile_id` and `profile_name` are present for profile-aware evaluations and may be absent in
+legacy single-search records.
 
 ## Scheduled mode
 

@@ -11,16 +11,21 @@ Implementation status:
 - **Phase 2 complete:** CLI execution activates and verifies the profile registry before running,
   can run a selected/default profile or all profiles sequentially, records profile-local schedule
   state, isolates profile failures, and shares the root model quota.
-- **Deferred:** profile UI/CRUD, profile selection in the existing web flows, and Telegram profile
-  labels remain future work. The legacy web service intentionally retains its existing single-search
-  paths until that UI phase is implemented.
+- **Phase 3 complete:** web UI profile selection, aggregate read-only scope, profile CRUD/archive,
+  profile-scoped tools/actions/downloads, and profile-aware pipeline views are implemented.
+- **Phase 4 complete:** Telegram headings now include safe profile labels across production,
+  manual per-result, and standalone test sends; diagnostics logs now include profile context for
+  profile filtering; `/healthz` reports non-ok only when migration integrity is inconsistent while
+  fresh unconfigured installs remain healthy/paused.
+- **Deferred:** release rollout safeguards and deployment execution remain operator-controlled.
 
 No deployment changes have been made for this feature.
 
 Current baseline:
 
 - Deployed application commit: `2b4d1de32b14722d4773f30d57f5662391093961`.
-- Existing production search: freezer search, postcode `6005JW`, 30 km radius.
+- Existing production default search criteria are migrated into the `freezers` profile. Do not
+  record personal search criteria in this document.
 - Existing production data must be preserved, including the current seen-ad state, evaluations,
   runtime status, pipeline progress, usage history, and saved configuration.
 - The latest full validation baseline is 72 passing tests, with Ruff and Pylance diagnostics clean.
@@ -95,7 +100,7 @@ An advanced agent such as Terra or Sol is a good choice if it can retain a longe
 - [usage.py](../src/marktplaats_ad_watcher/usage.py): global daily model budget.
 - [factory.py](../src/marktplaats_ad_watcher/factory.py): service construction, once profiles are passed through.
 
-### Requires profile awareness
+### Profile-aware components
 
 - [config.py](../src/marktplaats_ad_watcher/config.py): currently reads one search URL and one use-case prompt.
 - [runner.py](../src/marktplaats_ad_watcher/runner.py): currently executes one search and returns one run summary.
@@ -103,8 +108,10 @@ An advanced agent such as Terra or Sol is a good choice if it can retain a longe
 - [state.py](../src/marktplaats_ad_watcher/state.py): currently has one global seen-ad mapping.
 - [status.py](../src/marktplaats_ad_watcher/status.py): currently stores one global runtime status.
 - [pipeline_progress.py](../src/marktplaats_ad_watcher/pipeline_progress.py): current records are keyed by ad ID only.
-- [web.py](../src/marktplaats_ad_watcher/web.py): pages and actions currently assume one result set.
-- [telegram.py](../src/marktplaats_ad_watcher/telegram.py): notification content currently has no search identifier.
+- [web.py](../src/marktplaats_ad_watcher/web.py): profile scoping, aggregate mode, diagnostics filtering,
+  and migration-aware health behavior are implemented and should be preserved.
+- [telegram.py](../src/marktplaats_ad_watcher/telegram.py): profile labels in safe HTML headings are
+  implemented for production, manual, and standalone sends.
 
 ## Recommended domain model
 

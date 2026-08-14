@@ -62,3 +62,20 @@ def test_pipeline_progress_imports_production_evaluations(tmp_path: Path) -> Non
     assert records[0].source == "production"
     assert records[0].telegram_sent is None
     assert records[0].evaluated_ad.ad.id == "m1"
+
+
+def test_mark_telegram_sent_persists_profile_identity_when_missing(tmp_path: Path) -> None:
+    path = tmp_path / "pipeline_progress.json"
+    store = PipelineProgressStore(path)
+    store.save_ai_result(_evaluated_ad())
+
+    sent = store.mark_telegram_sent(
+        "m1",
+        message_id=42,
+        profile_id="freezers",
+        profile_name="Freezers",
+    )
+
+    assert sent.telegram_sent is True
+    assert sent.evaluated_ad.profile_id == "freezers"
+    assert sent.evaluated_ad.profile_name == "Freezers"

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
-from marktplaats_ad_watcher.models import Ad, EvaluationResult, TelegramSendResult
+from marktplaats_ad_watcher.models import Ad, EvaluatedAd, EvaluationResult, TelegramSendResult
 from marktplaats_ad_watcher.runner import Watcher
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatusStore
@@ -154,6 +154,49 @@ async def test_review_actions_are_stored_and_sent_to_telegram(tmp_path: Path) ->
     reloaded = SeenStore(settings.state_file)
     assert reloaded.has_seen("m123")
     assert '"next_action":"review"' in settings.results_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_production_notification_payload_includes_profile_metadata(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        active_profile_id="freezers",
+        active_profile_name="Freezers",
+    )
+    evaluator = RecordingEvaluator(
+        EvaluationResult(
+            relevant=True,
+            confidence=0.91,
+            reason="Matches criteria.",
+            next_action="notify",
+        )
+    )
+
+    class CapturingNotifier:
+        def __init__(self) -> None:
+            self.sent: list[EvaluatedAd] = []
+
+        async def send(self, evaluated_ad: Any) -> TelegramSendResult:
+            self.sent.append(evaluated_ad)
+            return TelegramSendResult(sent=True, message_id=7)
+
+    notifier = CapturingNotifier()
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=FakeMarktplaatsClient(
+            [Ad(id="m321", title="Private freezer", url="https://example.test/m321")]
+        ),
+        evaluator=evaluator,
+        notifier=notifier,
+        store=SeenStore(settings.state_file),
+    )
+
+    summary = await watcher.run_once()
+
+    assert summary.notified_count == 1
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].profile_id == "freezers"
+    assert notifier.sent[0].profile_name == "Freezers"
 
 
 @pytest.mark.asyncio

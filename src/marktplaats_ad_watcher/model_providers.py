@@ -71,8 +71,10 @@ class HttpModelEvaluator(ABC):
         if not isinstance(response_payload, dict):
             raise ValueError("Model response was not a JSON object at the protocol level.")
         response_text = self.response_text(response_payload)
+        profile_context = _profile_log_context(self._settings)
         LOGGER.info(
-            "Model response received for ad %s.",
+            "%sModel response received for ad %s.",
+            profile_context,
             ad.id,
             extra={"diagnostic_detail": response_text[:8000]},
         )
@@ -312,3 +314,13 @@ def _provider_error_details(response: httpx.Response) -> tuple[str | None, str]:
             if isinstance(raw_message, str) and raw_message.strip():
                 message = raw_message.strip()
     return code, message[:500]
+
+
+def _profile_log_context(settings: Settings) -> str:
+    if settings.active_profile_name and settings.active_profile_id:
+        return f"[{settings.active_profile_name} · {settings.active_profile_id}] "
+    if settings.active_profile_name:
+        return f"[{settings.active_profile_name}] "
+    if settings.active_profile_id:
+        return f"[{settings.active_profile_id}] "
+    return ""

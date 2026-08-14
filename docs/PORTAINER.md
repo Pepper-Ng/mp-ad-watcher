@@ -14,6 +14,9 @@ persistent `watcher-data` volume. The initialization container only corrects vol
 then exits successfully. The long-running watcher runs as a non-root user and exposes a `/healthz`
 endpoint that Docker uses for its health check.
 
+The health endpoint remains `ok` while a fresh installation is paused for first-run configuration.
+It reports non-ok only when profile migration integrity is inconsistent.
+
 The image is complete, but a fresh installation is intentionally not preconfigured. It can start
 and show the web UI without a Marktplaats URL or model key. The background watcher records a
 configuration error and retries every 60 seconds until the required values are saved. No source
@@ -183,7 +186,8 @@ the stack's manual pull/redeploy action. Inspect the Portainer logs for clone or
 
 **The container is unhealthy.** Read the container logs and verify that port 8080 is available
 inside the container. The Docker health check calls `http://127.0.0.1:8080/healthz` and does not
-require the admin token.
+require the admin token. A profile-migration integrity failure (for example, a backup or manifest
+checksum mismatch) also returns non-ok and should be treated as a data-consistency incident.
 
 **No Telegram message arrives.** Check that both Telegram fields are configured, that the bot has
 received an initial message from the target chat, and that model actions and confidence thresholds

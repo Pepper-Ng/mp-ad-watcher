@@ -76,6 +76,10 @@ the exception: it may come from the Portainer stack environment and is used with
 into the settings file unless the operator explicitly enters a new value in the form. CLI mode
 continues to support ordinary environment variables and `.env` loading.
 
+When profile-aware execution is active, model-response diagnostics include profile context in the
+log message prefix (for example `[Freezers · freezers]`). This keeps Diagnostics page filtering
+accurate without exposing provider secrets.
+
 ## Compatibility and migration
 
 Old `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, `DEEPSEEK_TEMPERATURE`, and

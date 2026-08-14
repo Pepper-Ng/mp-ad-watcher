@@ -48,17 +48,28 @@ class PipelineProgressStore:
         ad_id: str,
         *,
         message_id: int | None,
+        profile_id: str | None = None,
+        profile_name: str | None = None,
     ) -> PipelineProgressRecord:
         with _PROGRESS_LOCK:
             records = self._load()
             record = records.get(ad_id)
             if record is None:
                 raise ValueError("No saved AI result exists for this ad.")
+            evaluated_ad = record.evaluated_ad
+            profile_updates: dict[str, str] = {}
+            if evaluated_ad.profile_id is None and profile_id is not None:
+                profile_updates["profile_id"] = profile_id
+            if evaluated_ad.profile_name is None and profile_name is not None:
+                profile_updates["profile_name"] = profile_name
+            if profile_updates:
+                evaluated_ad = evaluated_ad.model_copy(update=profile_updates)
             updated = record.model_copy(
                 update={
                     "telegram_sent": True,
                     "telegram_sent_at": datetime.now(UTC),
                     "telegram_message_id": message_id,
+                    "evaluated_ad": evaluated_ad,
                 }
             )
             records[ad_id] = updated

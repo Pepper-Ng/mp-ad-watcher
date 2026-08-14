@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from marktplaats_ad_watcher.config import parse_dotenv, write_dotenv
+from marktplaats_ad_watcher.config import Settings, parse_dotenv, write_dotenv
 from marktplaats_ad_watcher.models import (
     Ad,
     EvaluatedAd,
@@ -19,6 +19,10 @@ from marktplaats_ad_watcher.models import (
     WatcherRunSummary,
 )
 from marktplaats_ad_watcher.pipeline_progress import PipelineProgressStore
+from marktplaats_ad_watcher.profiles import (
+    LEGACY_MIGRATION_NAME,
+    migrate_legacy_single_search,
+)
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
 from marktplaats_ad_watcher.usage import ModelUsageStore
@@ -808,6 +812,150 @@ async def test_pipeline_telegram_phases_are_explicit_and_record_delivery(
     assert progress is not None
     assert progress.telegram_sent is True
     assert progress.telegram_message_id == 42
+
+
+@pytest.mark.asyncio
+async def test_standalone_telegram_test_uses_active_profile_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "MARKTPLAATS_SEARCH_URL": "https://www.marktplaats.nl/lrp/api/search?query=test",
+            "MARKTPLAATS_USE_CASE": "Find freezer chests.",
+        },
+    )
+    captured: list[str] = []
+
+    async def fake_send_text(_: object, text: str) -> TelegramSendResult:
+        captured.append(text)
+        return TelegramSendResult(sent=True, message_id=44)
+
+    monkeypatch.setattr(
+        "marktplaats_ad_watcher.web.TelegramNotifier._send_text",
+        fake_send_text,
+    )
+
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/tools/telegram-test?token=admin-token")
+
+    assert response.status_code == 200
+    assert captured
+    assert "<b>[Freezers · freezers] Marktplaats Ad Watcher test</b>" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_manual_telegram_send_persists_profile_identity_for_imported_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    results_file = tmp_path / "evaluations.jsonl"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "MARKTPLAATS_SEARCH_URL": "https://www.marktplaats.nl/lrp/api/search?query=test",
+            "MARKTPLAATS_USE_CASE": "Find freezer chests.",
+            "RESULTS_FILE": str(results_file),
+            "STATE_FILE": str(tmp_path / "seen_ads.json"),
+            "STATUS_FILE": str(tmp_path / "runtime_status.json"),
+        },
+    )
+    legacy_result = EvaluatedAd(
+        ad=Ad(id="m1", title="Legacy freezer", url="https://www.marktplaats.nl/v/m1"),
+        result=EvaluationResult(
+            relevant=True,
+            confidence=0.88,
+            reason="Looks suitable.",
+            next_action="notify",
+        ),
+    )
+    results_file.write_text(legacy_result.model_dump_json() + "\n", encoding="utf-8")
+    sent_profiles: list[tuple[str | None, str | None]] = []
+
+    async def fake_send(_: object, value: EvaluatedAd) -> TelegramSendResult:
+        sent_profiles.append((value.profile_id, value.profile_name))
+        return TelegramSendResult(sent=True, message_id=42)
+
+    monkeypatch.setattr("marktplaats_ad_watcher.web.TelegramNotifier.send", fake_send)
+
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/tools/telegram?token=admin-token",
+            data={"ad_id": "m1"},
+        )
+
+    assert response.status_code == 200
+    assert sent_profiles == [("freezers", "Freezers")]
+    record = PipelineProgressStore(
+        tmp_path / "profiles" / "freezers" / "pipeline_progress.json"
+    ).get("m1")
+    assert record is not None
+    assert record.telegram_sent is True
+    assert record.evaluated_ad.profile_id == "freezers"
+    assert record.evaluated_ad.profile_name == "Freezers"
+
+
+@pytest.mark.asyncio
+async def test_healthz_is_paused_but_ok_when_search_settings_are_missing(tmp_path: Path) -> None:
+    app = create_web_app(env_file=tmp_path / "settings.env", dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert "paused" in response.text
+
+
+@pytest.mark.asyncio
+async def test_healthz_is_not_ok_when_profile_migration_is_inconsistent(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    write_dotenv(
+        env_file,
+        {
+            "MARKTPLAATS_SEARCH_URL": "https://www.marktplaats.nl/lrp/api/search?query=test",
+            "MARKTPLAATS_USE_CASE": "Find freezer chests.",
+            "STATE_FILE": str(tmp_path / "seen_ads.json"),
+            "RESULTS_FILE": str(tmp_path / "evaluations.jsonl"),
+            "STATUS_FILE": str(tmp_path / "runtime_status.json"),
+        },
+    )
+    (tmp_path / "seen_ads.json").write_text('{"seen_ads":{}}\n', encoding="utf-8")
+    (tmp_path / "evaluations.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "runtime_status.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "pipeline_progress.json").write_text('{"records":{}}\n', encoding="utf-8")
+    settings = Settings.from_environment(parse_dotenv(env_file))
+    migrate_legacy_single_search(settings)
+
+    backup_path = (
+        tmp_path
+        / "profile-migration-backups"
+        / LEGACY_MIGRATION_NAME
+        / "seen_ads.json"
+    )
+    backup_path.write_text('{"seen_ads":{"tampered":{"title":"changed"}}}\n', encoding="utf-8")
+
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 503
+    assert "profile migration inconsistent" in response.text
 
 
 @pytest.mark.asyncio
