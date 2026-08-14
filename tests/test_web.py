@@ -13,11 +13,13 @@ from marktplaats_ad_watcher.config import parse_dotenv, write_dotenv
 from marktplaats_ad_watcher.models import (
     Ad,
     EvaluatedAd,
+    EvaluationFailure,
     EvaluationResult,
     WatcherRunSummary,
 )
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatus
+from marktplaats_ad_watcher.usage import ModelUsageStore
 from marktplaats_ad_watcher.web import (
     ERROR_RETRY_SECONDS,
     RecentLogBuffer,
@@ -452,12 +454,12 @@ async def test_dashboard_explains_failed_ai_attempt(tmp_path: Path) -> None:
             notified_count=0,
             evaluation_failed_count=1,
             evaluation_failures=[
-                {
-                    "ad_id": "m1",
-                    "title": "Pending freezer",
-                    "url": "https://www.marktplaats.nl/v/m1",
-                    "error": "ModelProviderError: HTTP 429 (free_rate_limited)",
-                }
+                EvaluationFailure(
+                    ad_id="m1",
+                    title="Pending freezer",
+                    url="https://www.marktplaats.nl/v/m1",
+                    error="ModelProviderError: HTTP 429 (free_rate_limited)",
+                )
             ],
         ),
     )
@@ -492,6 +494,47 @@ def test_recent_log_buffer_redacts_admin_tokens() -> None:
     assert len(buffer.entries) == 1
     assert "very-secret-token" not in buffer.entries[0]["message"]
     assert "token=[REDACTED]" in buffer.entries[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_model_budget_increase_requires_confirmation_and_applies_immediately(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "settings.env"
+    results_file = tmp_path / "evaluations.jsonl"
+    usage_file = tmp_path / "model_usage.json"
+    write_dotenv(
+        env_file,
+        {
+            "WEB_ADMIN_TOKEN": "admin-token",
+            "RESULTS_FILE": str(results_file),
+        },
+    )
+    ModelUsageStore(usage_file).reserve()
+    app = create_web_app(env_file=env_file, dry_run=True)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/model-usage")
+        page = await client.get("/model-usage?token=admin-token")
+        confirmation = await client.post(
+            "/model-usage/limit?token=admin-token",
+            data={"limit": "40"},
+        )
+        before_apply = ModelUsageStore(usage_file).snapshot()
+        applied = await client.post(
+            "/model-usage/limit/apply?token=admin-token",
+            data={"limit": "40"},
+            follow_redirects=False,
+        )
+
+    assert denied.status_code == 401
+    assert page.status_code == 200
+    assert "1 / 30" in page.text
+    assert "Confirm increased model budget" in confirmation.text
+    assert before_apply.limit == 30
+    assert applied.status_code == 303
+    assert ModelUsageStore(usage_file).snapshot().limit == 40
 
 
 @pytest.mark.asyncio
@@ -575,12 +618,12 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
                 notified_count=0,
                 evaluation_failed_count=1,
                 evaluation_failures=[
-                    {
-                        "ad_id": preview_ad.id,
-                        "title": preview_ad.title,
-                        "url": preview_ad.url,
-                        "error": "ModelProviderError: free_rate_limited",
-                    }
+                    EvaluationFailure(
+                        ad_id=preview_ad.id,
+                        title=preview_ad.title,
+                        url=preview_ad.url,
+                        error="ModelProviderError: free_rate_limited",
+                    )
                 ],
             )
         ).model_dump_json(),
@@ -594,6 +637,7 @@ async def test_pipeline_tools_fetch_and_ai_test_do_not_persist(
         return [preview_ad]
 
     async def fake_test_preview(self: WatcherService, ad_id: str) -> EvaluatedAd:
+        del self
         assert ad_id == preview_ad.id
         return EvaluatedAd(
             ad=preview_ad,

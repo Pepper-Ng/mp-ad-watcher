@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import json
+import threading
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+_USAGE_LOCK = threading.Lock()
+
+
+class ModelDailyLimitExceeded(RuntimeError):
+    def __init__(self, *, used: int, limit: int, reset_at: datetime) -> None:
+        self.used = used
+        self.limit = limit
+        self.reset_at = reset_at
+        super().__init__(
+            f"Daily model request limit reached ({used}/{limit}). "
+            f"The budget resets at {reset_at.isoformat()}."
+        )
+
+
+@dataclass(frozen=True)
+class ModelUsageSnapshot:
+    day: date
+    used: int
+    limit: int
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+    @property
+    def reset_at(self) -> datetime:
+        return datetime.combine(self.day + timedelta(days=1), time.min, tzinfo=UTC)
+
+
+class ModelUsageStore:
+    def __init__(self, path: Path, *, default_limit: int = 30) -> None:
+        if default_limit < 1:
+            raise ValueError("The default daily model request limit must be positive.")
+        self._path = path
+        self._default_limit = default_limit
+
+    def snapshot(self) -> ModelUsageSnapshot:
+        with _USAGE_LOCK:
+            state = self._load_current()
+            self._save(state)
+            return self._snapshot(state)
+
+    def reserve(self) -> ModelUsageSnapshot:
+        with _USAGE_LOCK:
+            state = self._load_current()
+            snapshot = self._snapshot(state)
+            if snapshot.used >= snapshot.limit:
+                self._save(state)
+                raise ModelDailyLimitExceeded(
+                    used=snapshot.used,
+                    limit=snapshot.limit,
+                    reset_at=snapshot.reset_at,
+                )
+            state["used"] = snapshot.used + 1
+            self._save(state)
+            return self._snapshot(state)
+
+    def set_limit(self, limit: int) -> ModelUsageSnapshot:
+        if limit < 1 or limit > 1000:
+            raise ValueError("The daily model request limit must be between 1 and 1000.")
+        with _USAGE_LOCK:
+            state = self._load_current()
+            state["limit"] = limit
+            self._save(state)
+            return self._snapshot(state)
+
+    def _load_current(self) -> dict[str, Any]:
+        today = datetime.now(UTC).date()
+        loaded: dict[str, Any] = {}
+        if self._path.exists():
+            try:
+                candidate = json.loads(self._path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                candidate = None
+            if isinstance(candidate, dict):
+                loaded = candidate
+
+        limit = loaded.get("limit")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            limit = self._default_limit
+        used = loaded.get("used")
+        if not isinstance(used, int) or isinstance(used, bool) or used < 0:
+            used = 0
+        if loaded.get("day") != today.isoformat():
+            used = 0
+
+        return {"day": today.isoformat(), "used": used, "limit": limit}
+
+    def _save(self, state: dict[str, Any]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self._path)
+
+    @staticmethod
+    def _snapshot(state: dict[str, Any]) -> ModelUsageSnapshot:
+        return ModelUsageSnapshot(
+            day=date.fromisoformat(str(state["day"])),
+            used=int(state["used"]),
+            limit=int(state["limit"]),
+        )

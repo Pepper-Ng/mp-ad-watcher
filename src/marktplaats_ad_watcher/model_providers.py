@@ -16,6 +16,7 @@ from marktplaats_ad_watcher.evaluation import (
 )
 from marktplaats_ad_watcher.model_config import ModelProtocol, provider_preset
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
+from marktplaats_ad_watcher.usage import ModelUsageStore
 
 
 class ModelProviderError(RuntimeError):
@@ -36,10 +37,12 @@ class HttpModelEvaluator(ABC):
             raise ValueError("MODEL_API_KEY is required for normal evaluation runs.")
         self._settings = settings
         self._preset = provider_preset(settings.model_provider)
+        self._usage = ModelUsageStore(settings.results_file.parent / "model_usage.json")
 
     async def evaluate(self, ad: Ad) -> EvaluationResult:
         prompt = build_evaluation_prompt(self._settings.marktplaats_use_case, ad)
         endpoint, headers, payload = self.request(prompt)
+        self._usage.reserve()
         async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
             try:

@@ -17,6 +17,7 @@ from marktplaats_ad_watcher.model_providers import (
     build_model_evaluator,
 )
 from marktplaats_ad_watcher.models import Ad
+from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded, ModelUsageStore
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -285,6 +286,57 @@ async def test_provider_http_error_exposes_safe_code_and_message(
     assert captured.value.status_code == 429
     assert captured.value.code == "free_rate_limited"
     assert "Free model capacity is limited" in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_model_evaluator_enforces_daily_budget_before_outbound_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
+            nonlocal calls
+            del kwargs
+            calls += 1
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"relevant":true,"confidence":0.9,'
+                                    '"reason":"Good match.","signals":[],'
+                                    '"concerns":[],"next_action":"notify"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    settings = _settings(tmp_path)
+    ModelUsageStore(settings.results_file.parent / "model_usage.json").set_limit(1)
+    evaluator = OpenAICompatibleEvaluator(settings)
+
+    await evaluator.evaluate(_ad())
+    with pytest.raises(ModelDailyLimitExceeded):
+        await evaluator.evaluate(_ad())
+
+    assert calls == 1
 
 
 def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> None:

@@ -31,6 +31,11 @@ from marktplaats_ad_watcher.model_config import (
 from marktplaats_ad_watcher.model_providers import ModelProviderError, build_model_evaluator
 from marktplaats_ad_watcher.models import Ad, EvaluatedAd, WatcherRunSummary
 from marktplaats_ad_watcher.status import RuntimeStatus, RuntimeStatusStore
+from marktplaats_ad_watcher.usage import (
+    ModelDailyLimitExceeded,
+    ModelUsageSnapshot,
+    ModelUsageStore,
+)
 
 EDITABLE_KEYS = [
     "MARKTPLAATS_SEARCH_URL",
@@ -163,6 +168,17 @@ class WatcherService:
         values = self.read_config()
         status_file = Path(values.get("STATUS_FILE", "data/runtime_status.json"))
         return RuntimeStatusStore(status_file)
+
+    def model_usage_store(self) -> ModelUsageStore:
+        values = self.read_config()
+        results_file = Path(values["RESULTS_FILE"])
+        return ModelUsageStore(results_file.parent / "model_usage.json")
+
+    def model_usage(self) -> ModelUsageSnapshot:
+        return self.model_usage_store().snapshot()
+
+    def set_model_daily_limit(self, limit: int) -> ModelUsageSnapshot:
+        return self.model_usage_store().set_limit(limit)
 
     @property
     def preview_ads(self) -> list[Ad]:
@@ -307,7 +323,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 {_navigation(request, current="dashboard")}
         {_warning_for_missing_token(service)}
                 {_status_panel(status)}
-                {_last_run_panel(status.last_summary)}
+                {_last_run_panel(status)}
+        {_model_usage_panel(service.model_usage(), request)}
                 <section class="panel">
                     <h2>Activity since reset</h2>
                     <div class="metric-grid">
@@ -429,15 +446,21 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         values = service.read_config()
         seen = _read_seen_ads(Path(values["STATE_FILE"]), kind="all")
         seen_by_id = {str(entry["id"]): entry for entry in seen}
-        summary = service.status_store().read().last_summary
+        runtime_status = service.status_store().read()
+        summary = runtime_status.last_summary
+        attempt_time = _format_time_text(runtime_status.last_finished_at)
         failures_by_id = (
-            {failure.ad_id: failure.error for failure in summary.evaluation_failures}
+            {
+                failure.ad_id: f"Latest production attempt at {attempt_time}: {failure.error}"
+                for failure in summary.evaluation_failures
+            }
             if summary
             else {}
         )
         body = f"""
         {_navigation(request, current="tools")}
         {_notice(notice, error=error)}
+        {_model_usage_panel(service.model_usage(), request, compact=True)}
         <section class="panel">
           <h2>Phase 1 · Fetch current ads</h2>
           <p><strong>Fetch only.</strong> Contacts Marktplaats and changes no local state.</p>
@@ -530,6 +553,90 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         </section>
         """
         return HTMLResponse(_page("Diagnostics", body))
+
+    async def model_usage(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        usage = service.model_usage()
+        notice = request.query_params.get("notice")
+        body = f"""
+        {_navigation(request, current="usage")}
+        {_notice(notice)}
+        {_model_usage_panel(usage, request, compact=True)}
+        <section class="panel">
+          <h2>Change daily limit</h2>
+          <p>All production and manual AI attempts share this UTC-daily budget. Failed provider
+          requests count because they consumed an outbound attempt.</p>
+          <form method="post" action="/model-usage/limit{_token_query(request)}">
+            <label>Requests per UTC day
+              <input type="number" name="limit" min="1" max="1000" value="{usage.limit}">
+            </label>
+            <button type="submit">Review limit change</button>
+          </form>
+        </section>
+        """
+        return HTMLResponse(_page("Model request budget", body))
+
+    async def model_usage_limit(request: Request) -> HTMLResponse | RedirectResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        try:
+            new_limit = int(form.get("limit", [""])[0])
+            if new_limit < 1 or new_limit > 1000:
+                raise ValueError
+        except ValueError:
+            return HTMLResponse(
+                _page("Invalid limit", "<p class='alert'>Enter a value from 1 to 1000.</p>"),
+                status_code=400,
+            )
+        current = service.model_usage()
+        if new_limit <= current.limit:
+            updated = service.set_model_daily_limit(new_limit)
+            notice = f"Daily model request limit changed to {updated.limit}."
+            return RedirectResponse(
+                f"/model-usage{_query_with_values(request, notice=notice)}",
+                status_code=303,
+            )
+        body = f"""
+        {_navigation(request, current="usage")}
+        <section class="panel full-run-panel">
+          <h2>Confirm increased model budget</h2>
+          <p>Increase the daily limit from <strong>{current.limit}</strong> to
+          <strong>{new_limit}</strong>? Usage is currently {current.used}; this immediately permits
+          up to {max(0, new_limit - current.used)} more outbound request(s) today.</p>
+          <form method="post" action="/model-usage/limit/apply{_token_query(request)}">
+            <input type="hidden" name="limit" value="{new_limit}">
+            <button class="warning-button" type="submit">Confirm increased limit</button>
+            <a href="/model-usage{_token_query(request)}">Cancel</a>
+          </form>
+        </section>
+        """
+        return HTMLResponse(_page("Confirm model budget", body))
+
+    async def model_usage_limit_apply(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        try:
+            new_limit = int(form.get("limit", [""])[0])
+            current = service.model_usage()
+            if new_limit <= current.limit or new_limit > 1000:
+                raise ValueError
+        except ValueError:
+            return HTMLResponse(
+                _page("Invalid increase", "<p class='alert'>The increase is no longer valid.</p>"),
+                status_code=400,
+            )
+        updated = service.set_model_daily_limit(new_limit)
+        notice = f"Daily model request limit increased to {updated.limit} and is active now."
+        return RedirectResponse(
+            f"/model-usage{_query_with_values(request, notice=notice)}",
+            status_code=303,
+        )
 
     async def config_get(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -737,6 +844,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/tools/test", tools_test, methods=["POST"]),
             Route("/tools/full-run", full_run_confirm),
             Route("/diagnostics", diagnostics),
+            Route("/model-usage", model_usage),
+            Route("/model-usage/limit", model_usage_limit, methods=["POST"]),
+            Route("/model-usage/limit/apply", model_usage_limit_apply, methods=["POST"]),
             Route("/config", config_get, methods=["GET"]),
             Route("/config", config_post, methods=["POST"]),
             Route("/run-now", run_now, methods=["POST"]),
@@ -784,6 +894,7 @@ def _navigation(request: Request, *, current: str) -> str:
         ("evaluations", "/evaluations", "Evaluations"),
         ("seen", "/seen", "Seen ads"),
         ("tools", "/tools", "Pipeline tools"),
+        ("usage", "/model-usage", "Model budget"),
         ("diagnostics", "/diagnostics", "Diagnostics"),
         ("config", "/config", "Configuration"),
     ]
@@ -828,7 +939,8 @@ def _status_panel(status: RuntimeStatus) -> str:
     """
 
 
-def _last_run_panel(summary: WatcherRunSummary | None) -> str:
+def _last_run_panel(status: RuntimeStatus) -> str:
+    summary = status.last_summary
     if summary is None:
         return """
         <section class="panel">
@@ -841,10 +953,11 @@ def _last_run_panel(summary: WatcherRunSummary | None) -> str:
         if summary.bootstrapped_count
         else ""
     )
-    failures = _evaluation_failures(summary)
+    failures = _evaluation_failures(summary, finished_at=status.last_finished_at)
+    run_label = f"Run #{status.total_runs}" if status.total_runs else "Run before counter reset"
     return f"""
     <section class="panel">
-      <h2>Last run</h2>
+      <h2>Latest completed run · {run_label} · {_format_time(status.last_finished_at)}</h2>
       <p class="pipeline-summary">
         <strong>{summary.fetched_count}</strong> fetched
         <span>→</span> <strong>{summary.kept_count}</strong> eligible
@@ -862,12 +975,16 @@ def _last_run_panel(summary: WatcherRunSummary | None) -> str:
         <span class="mini-badge">Telegram {summary.notified_count}</span>
         {baseline}
       </div>
-            {failures}
+        {failures}
     </section>
     """
 
 
-def _evaluation_failures(summary: WatcherRunSummary) -> str:
+def _evaluation_failures(
+    summary: WatcherRunSummary,
+    *,
+    finished_at: datetime | None,
+) -> str:
         if not summary.evaluation_failures:
                 return ""
         items = "".join(
@@ -877,9 +994,33 @@ def _evaluation_failures(summary: WatcherRunSummary) -> str:
                 for failure in summary.evaluation_failures
         )
         return (
-            "<div class='alert' role='alert'><strong>AI evaluation failures</strong>"
+            "<div class='alert' role='alert'><strong>AI failures in this latest completed run "
+            f"({_format_time(finished_at)})</strong>"
             f"<ul>{items}</ul></div>"
         )
+
+
+def _model_usage_panel(
+        usage: ModelUsageSnapshot,
+        request: Request,
+        *,
+        compact: bool = False,
+) -> str:
+        heading = "Model request budget" if not compact else "Model budget"
+        return f"""
+        <section class="panel usage-panel">
+            <div class="section-heading">
+                <h2>{heading}</h2>
+                <strong>{usage.used} / {usage.limit}</strong>
+            </div>
+            <progress value="{usage.used}" max="{usage.limit}">
+                {usage.used} of {usage.limit}
+            </progress>
+            <p>{usage.remaining} request(s) remaining. Resets {_format_time(usage.reset_at)}.
+                <a href="/model-usage{_token_query(request)}">Manage limit</a>
+            </p>
+        </section>
+        """
 
 
 def _metric(label: str, value: int) -> str:
@@ -887,17 +1028,28 @@ def _metric(label: str, value: int) -> str:
 
 
 def _format_time(value: datetime | str | None) -> str:
+    text, iso_value = _format_time_parts(value)
+    if iso_value is None:
+        return text
+    return f"<time datetime='{escape(iso_value)}'>{text}</time>"
+
+
+def _format_time_text(value: datetime | str | None) -> str:
+    return _format_time_parts(value)[0]
+
+
+def _format_time_parts(value: datetime | str | None) -> tuple[str, str | None]:
     if value is None:
-        return "Not available"
+        return "Not available", None
     parsed = value
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            return escape(value)
+            return escape(value), None
     assert isinstance(parsed, datetime)
     display = parsed.astimezone(UTC).strftime("%d %b %Y, %H:%M UTC")
-    return f"<time datetime='{escape(parsed.isoformat())}'>{display}</time>"
+    return display, parsed.isoformat()
 
 
 def _notice(message: str | None, *, error: str | None = None) -> str:
@@ -909,7 +1061,7 @@ def _notice(message: str | None, *, error: str | None = None) -> str:
 
 
 def _safe_error(prefix: str, error: Exception) -> str:
-    if isinstance(error, ValueError | ModelProviderError):
+    if isinstance(error, ValueError | ModelProviderError | ModelDailyLimitExceeded):
         return f"{prefix}: {error}"
     return f"{prefix}. Check the watcher logs for technical details and try again."
 
@@ -1216,8 +1368,9 @@ def _page(title: str, body: str) -> str:
             color: #222;
             font-family: system-ui, sans-serif;
             margin: 0 auto;
-            max-width: 960px;
+            max-width: 1280px;
             padding: 1.5rem;
+            width: 100%;
         }}
         h1 {{ font-size: 1.65rem; margin: 0 0 1.25rem; }}
         h2 {{ font-size: 1.15rem; margin: 0 0 0.85rem; }}
@@ -1314,6 +1467,7 @@ def _page(title: str, body: str) -> str:
             flex-wrap: wrap;
             gap: 0.55rem;
         }}
+        .badge-row + .alert {{ margin-top: 1rem; }}
         .mini-badge {{ background: #e8eaed; color: #30343a; }}
         .metric-grid {{
             display: grid;
@@ -1358,7 +1512,9 @@ def _page(title: str, body: str) -> str:
             padding-top: 1rem;
         }}
         .filter-form {{ align-items: end; display: flex; flex-wrap: wrap; gap: 0.75rem; }}
-        .filter-form label {{ min-width: 12rem; }}
+        .filter-form label {{ flex: 0 1 18rem; min-width: 12rem; }}
+        .filter-form select {{ max-width: 18rem; }}
+        input[type="number"] {{ max-width: 10rem; }}
         .evaluation-card {{
             border: 1px solid #d5d5d5;
             border-radius: 6px;
@@ -1381,6 +1537,10 @@ def _page(title: str, body: str) -> str:
         .table-scroll {{ overflow-x: auto; }}
         .history-table {{ min-width: 720px; }}
         .log-table {{ min-width: 850px; }}
+        .log-table th:first-child, .log-table td:first-child {{
+            min-width: 12.5rem;
+            white-space: nowrap;
+        }}
         .log-message {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
         .log-level {{
             border-radius: 1rem;
@@ -1393,6 +1553,8 @@ def _page(title: str, body: str) -> str:
         .log-info, .log-debug {{ background: #e8eaed; color: #4f5358; }}
         .secondary {{ color: #5f646a; display: block; font-size: 0.82rem; margin-top: 0.25rem; }}
         .failure-detail {{ color: #8a2020; }}
+        .usage-panel progress {{ height: 0.85rem; width: 100%; }}
+        .usage-panel p {{ margin-bottom: 0; }}
         .preview-list {{ display: grid; gap: 0.55rem; margin: 1rem 0; }}
         .preview-card {{
             align-items: start;
