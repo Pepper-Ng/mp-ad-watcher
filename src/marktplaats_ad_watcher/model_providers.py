@@ -40,7 +40,7 @@ class HttpModelEvaluator(ABC):
             raise ValueError("MODEL_API_KEY is required for normal evaluation runs.")
         self._settings = settings
         self._preset = provider_preset(settings.model_provider)
-        self._usage = ModelUsageStore(settings.results_file.parent / "model_usage.json")
+        self._usage = ModelUsageStore(settings.global_model_usage_file)
 
     async def evaluate(self, ad: Ad) -> EvaluationResult:
         prompt = build_evaluation_prompt(

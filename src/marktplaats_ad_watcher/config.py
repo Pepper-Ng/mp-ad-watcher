@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from marktplaats_ad_watcher.model_config import REASONING_EFFORTS, provider_preset
+
+if TYPE_CHECKING:
+    from marktplaats_ad_watcher.profiles import SearchProfile
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,8 @@ class Settings:
     user_agent: str
     web_admin_token: str | None
     dry_run: bool = False
+    persistent_data_root: Path | None = None
+    active_profile_id: str | None = None
 
     def __post_init__(self) -> None:
         preset = provider_preset(self.model_provider)
@@ -67,6 +73,44 @@ class Settings:
             raise ValueError(f"MODEL_REASONING_EFFORT must be one of: {supported}.")
         if not self.user_agent.strip():
             raise ValueError("USER_AGENT must not be empty.")
+
+    @property
+    def data_root(self) -> Path:
+        """Persistent root shared by profiles and the global model quota."""
+
+        return self.persistent_data_root or self.results_file.parent
+
+    @property
+    def global_model_usage_file(self) -> Path:
+        return self.data_root / "model_usage.json"
+
+    def legacy_search_file_paths(self) -> dict[str, Path]:
+        """Return legacy single-search persistence paths without including global usage."""
+
+        return {
+            "seen_ads.json": self.state_file,
+            "evaluations.jsonl": self.results_file,
+            "runtime_status.json": self.status_file,
+            "pipeline_progress.json": self.results_file.parent / "pipeline_progress.json",
+        }
+
+    def for_profile(self, profile: SearchProfile) -> Settings:
+        """Resolve search-specific values and storage while retaining root-global settings."""
+
+        from marktplaats_ad_watcher.profiles import profile_storage_paths
+
+        paths = profile_storage_paths(self.data_root, profile.id)
+        return replace(
+            self,
+            marktplaats_search_url=profile.search_url,
+            marktplaats_use_case=profile.use_case,
+            bootstrap_existing_ads=profile.bootstrap_existing_ads,
+            state_file=paths.state_file,
+            results_file=paths.results_file,
+            status_file=paths.status_file,
+            persistent_data_root=self.data_root,
+            active_profile_id=profile.id,
+        )
 
     @staticmethod
     def from_environment(

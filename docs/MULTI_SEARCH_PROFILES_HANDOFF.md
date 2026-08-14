@@ -8,11 +8,34 @@ This document records the feasibility assessment for generalizing the watcher fr
 
 Current baseline:
 
-- Deployed application commit: `fef57ba2d72ed904613f01a168bbc93dc8c7d831`.
+- Deployed application commit: `2b4d1de32b14722d4773f30d57f5662391093961`.
 - Existing production search: freezer search, postcode `6005JW`, 30 km radius.
-- Existing production data must be preserved, including the current seen-ad state and evaluations.
-- The latest full validation baseline is 67 passing tests, with Ruff and Pylance diagnostics clean.
+- Existing production data must be preserved, including the current seen-ad state, evaluations,
+  runtime status, pipeline progress, usage history, and saved configuration.
+- The latest full validation baseline is 72 passing tests, with Ruff and Pylance diagnostics clean.
 - Portainer stack `17` is the only permitted deployment target. Do not modify any other Portainer object.
+
+## Non-negotiable migration invariant
+
+The existing freezer search is the production system of record. The multi-profile implementation
+must preserve it completely and make it the **first enabled profile** after migration.
+
+This is not a best-effort migration. The update is acceptable only if all currently persisted data
+is either retained intact in its legacy location or copied and verified in the new profile storage.
+No saved ad may become new again, no historical evaluation may disappear, and no migration may
+cause duplicate Telegram notifications.
+
+The migrated freezer profile must:
+
+- Use a stable ID such as `freezers`.
+- Copy the existing Marktplaats search URL and evaluation instructions exactly.
+- Be enabled by default.
+- Have the first persistent display/scheduling order, for example `sort_order: 0`.
+- Be selected as the default profile when no profile is specified in the UI or a legacy CLI workflow.
+- Retain the current seen-ad, evaluation, failure, runtime, pipeline, and model-budget behavior.
+
+Adding later profiles must never change, replace, re-bootstrap, or silently reset the migrated
+freezer profile.
 
 ## User goal
 
@@ -83,6 +106,7 @@ Suggested fields:
 - `search_url`: Marktplaats `lrp/api/search` JSON endpoint.
 - `use_case`: evaluation prompt and criteria.
 - `enabled`: whether the profile is scheduled.
+- `sort_order`: stable integer ordering; the migrated freezer profile is `0` and appears first.
 - `poll_interval_seconds`: optional override; otherwise use the global default.
 - `max_ads_per_run`: optional safety limit.
 - `created_at` and `updated_at`.
@@ -101,6 +125,7 @@ Example conceptual profile record:
   "search_url": "https://www.marktplaats.nl/lrp/api/search?...",
   "use_case": "Find reliable chest freezers ...",
   "enabled": true,
+  "sort_order": 0,
   "poll_interval_seconds": 900,
   "max_ads_per_run": 10,
   "created_at": "2026-08-14T00:00:00Z",
@@ -134,16 +159,34 @@ Alternative storage designs are acceptable if they preserve the same isolation g
 
 The current deployment uses legacy single-search files such as `seen_ads.json`, `evaluations.jsonl`, `runtime_status.json`, and `pipeline_progress.json`. Migration must:
 
-1. Detect legacy data when no profile registry exists.
-2. Create one profile representing the current configured search.
-3. Copy or atomically move the legacy records into that profile's namespace.
-4. Preserve baseline markers, processed evaluations, failures, and Telegram delivery state.
-5. Write a migration marker or otherwise make the operation idempotent.
-6. Avoid treating migrated ads as new and sending duplicate Telegram notifications.
-7. Keep old environment variables working for CLI/backwards compatibility when no profile registry is present.
-8. Fail safely with a clear diagnostic if a migration cannot be completed; never silently delete history.
+1. Detect legacy data when no profile registry exists and stop safely if its shape is invalid.
+2. Create an immutable backup copy of every legacy file before changing profile storage. Keep this
+  backup inside the persistent data volume and record it in migration metadata; do not rely only on
+  an operator remembering to make a manual backup.
+3. Create one enabled `freezers` profile with `sort_order: 0`, copying the existing search URL and
+  evaluation instructions exactly. It must be the default selected profile for the UI and legacy
+  CLI behavior.
+4. Copy—not move or delete—the legacy `seen_ads.json`, `evaluations.jsonl`,
+  `runtime_status.json`, and `pipeline_progress.json` into that profile's namespace. Preserve the
+  root files until an operator deliberately removes the backup after a verified release.
+5. Preserve baseline markers, processed evaluations, pending failures, Telegram delivery state, and
+  model-usage history. `model_usage.json` remains a global file and must not be reset, copied into
+  a profile, or double-counted.
+6. Verify imported records before activating profile mode: compare seen-ad IDs, JSONL record count,
+  pipeline record count, and a checksum or equivalent integrity marker for every copied file.
+7. Write a versioned migration marker only after all copies and verification succeed, making the
+  operation idempotent and safe to resume after a restart.
+8. Never bootstrap the migrated freezer profile. Its migrated seen IDs must be used immediately so
+  existing ads cannot become new or generate duplicate model calls/Telegram notifications.
+9. Keep old environment variables working for CLI/backwards compatibility when no profile registry
+  exists. Once the registry exists, legacy URL/prompt settings must resolve to the default
+  `freezers` profile without creating a second independent search.
+10. Fail safely with a clear diagnostic if a migration cannot be completed. Do not silently delete,
+   overwrite, replace, or partially activate any historical data.
 
-The current freezer search should become the first profile. Prefer preserving its existing data rather than bootstrapping it again.
+The current freezer search must become the first profile; it must not be re-bootstrapped after the
+update. A migration that only creates an empty profile or discards current history is a release
+blocker.
 
 Evaluation records should include a profile ID and preferably a prompt/profile revision. Existing JSONL records without a profile ID should be interpreted as belonging to the migrated legacy profile.
 
@@ -174,6 +217,8 @@ The current pages should remain recognizable. Add a profile selector to the Dash
 Recommended behavior:
 
 - `All searches` shows aggregate counts and recent activity.
+- The migrated `Freezers` profile appears first in selectors/tabs and is the default view when a
+  user has not selected another profile.
 - Selecting one profile scopes cards, tables, actions, errors, and downloads to that profile.
 - Every result card visibly shows the profile name.
 - Profile-specific actions carry the profile ID in their form/action URL; never infer it from an untrusted display label.
@@ -249,6 +294,8 @@ Add focused tests before deployment. At minimum:
 - Reject invalid URLs, empty prompts, duplicate IDs, unsafe IDs, and invalid intervals.
 - Preserve global settings and secrets.
 - Migrate the legacy single-search configuration exactly once.
+- Migrate the legacy freezer configuration into the enabled default `freezers` profile with
+  `sort_order: 0` and unchanged URL/prompt values.
 
 ### State/evaluation isolation tests
 
@@ -256,6 +303,9 @@ Add focused tests before deployment. At minimum:
 - Baseline state is isolated per profile.
 - An evaluation or failure in one profile does not change another profile.
 - Existing legacy records are assigned to the migrated profile without duplication.
+- Legacy source files are retained as a verified backup after successful migration.
+- Seen-ad IDs, evaluation count, pipeline records, failures, and model usage are identical before
+  and after migration.
 - Prompt/profile revision metadata is persisted when implemented.
 
 ### Runner/scheduling tests
@@ -320,6 +370,9 @@ Run the complete suite, Ruff, and Pylance diagnostics. Before any production upd
 
 - Run the full local test/lint/diagnostic suite.
 - Test migration and rollback using a data-volume copy.
+- Test the migration against a copy of the actual current watcher-data volume, not only fabricated
+  fixtures. Verify that the `Freezers` profile is first, enabled, selected by default, and has the
+  same counts/checksums as the legacy data before deployment.
 - Review the diff for secrets and personal search data.
 - Commit the implementation separately from deployment.
 - Deploy only after explicit approval, and only to Portainer stack `17`.
@@ -333,6 +386,10 @@ The feature is ready when:
 - Each profile can use a different URL and evaluation prompt.
 - Profiles have isolated state, evaluations, failures, statuses, and pipeline progress.
 - The existing freezer search and its history survive migration unchanged.
+- The existing freezer search is the first enabled/default profile, with its original URL, prompt,
+  seen state, evaluations, status, pipeline records, and global usage accounting preserved.
+- Legacy single-search files remain intact as a verified backup until an operator explicitly
+  approves their removal.
 - The UI can inspect one profile or all profiles without ambiguity.
 - Telegram messages clearly identify the originating profile.
 - One profile cannot prevent the others from running.
