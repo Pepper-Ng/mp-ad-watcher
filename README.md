@@ -159,9 +159,14 @@ Tune this with:
 
 ```env
 NOTIFY_REVIEW_ACTIONS=true
+NOTIFY_AI_FAILURES=true
 NOTIFY_MIN_CONFIDENCE=0.65
 REVIEW_MIN_CONFIDENCE=0
 ```
+
+`NOTIFY_AI_FAILURES` defaults to `true`. It sends one Telegram alert for a new production model
+evaluation failure signature, then suppresses identical retry failures until the affected model
+evaluation succeeds. Disable it to opt out. Manual pipeline AI tests never send this alert.
 
 ## Image handling
 

@@ -5,7 +5,7 @@ from html import escape
 import httpx
 
 from marktplaats_ad_watcher.config import Settings
-from marktplaats_ad_watcher.models import EvaluatedAd, TelegramSendResult
+from marktplaats_ad_watcher.models import EvaluatedAd, EvaluationFailure, TelegramSendResult
 
 
 class TelegramNotifier:
@@ -30,6 +30,18 @@ class TelegramNotifier:
         return await self._send_text(
             f"<b>{escape(heading)}</b>\n"
             "Telegram connectivity is configured and working."
+        )
+
+    async def send_ai_failure_alert(
+        self,
+        failures: list[EvaluationFailure],
+    ) -> TelegramSendResult:
+        return await self._send_text(
+            _format_ai_failure_alert(
+                failures,
+                profile_id=self._settings.active_profile_id,
+                profile_name=self._settings.active_profile_name,
+            )
         )
 
     async def _send_text(self, text: str) -> TelegramSendResult:
@@ -97,6 +109,34 @@ def _format_message(
         lines.append("Concerns: " + escape("; ".join(result.concerns[:3])))
 
     return "\n".join(lines)
+
+
+def _format_ai_failure_alert(
+    failures: list[EvaluationFailure],
+    *,
+    profile_id: str | None,
+    profile_name: str | None,
+) -> str:
+    heading = _message_heading(
+        "AI evaluation needs attention",
+        profile_id=profile_id,
+        profile_name=profile_name,
+    )
+    lines = [
+        f"<b>{escape(heading)}</b>",
+        (
+            f"A production run could not evaluate {len(failures)} listing(s). "
+            "They remain pending and will retry automatically."
+        ),
+    ]
+    for failure in failures[:3]:
+        lines.append(
+            f'<a href="{escape(failure.url)}">{escape(failure.title)}</a>\n'
+            f"Error: {escape(failure.error)}"
+        )
+    if len(failures) > 3:
+        lines.append(f"Plus {len(failures) - 3} additional failed listing(s).")
+    return "\n\n".join(lines)
 
 
 def _message_heading(base_heading: str, *, profile_id: str | None, profile_name: str | None) -> str:

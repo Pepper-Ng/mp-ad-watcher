@@ -67,6 +67,7 @@ EDITABLE_KEYS = [
     "NOTIFY_MIN_CONFIDENCE",
     "REVIEW_MIN_CONFIDENCE",
     "NOTIFY_REVIEW_ACTIONS",
+    "NOTIFY_AI_FAILURES",
     "MODEL_PROVIDER",
     "MODEL_API_KEY",
     "MODEL_BASE_URL",
@@ -92,6 +93,7 @@ BOOLEAN_KEYS = {
     "BOOTSTRAP_EXISTING_ADS",
     "EXCLUDE_ADMARKT_ADS",
     "NOTIFY_REVIEW_ACTIONS",
+    "NOTIFY_AI_FAILURES",
     "MODEL_JSON_MODE",
     "SEND_IMAGE_CONTENT_TO_MODEL",
     "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW",
@@ -113,6 +115,7 @@ CONFIG_DEFAULTS = {
     "NOTIFY_MIN_CONFIDENCE": "0.65",
     "REVIEW_MIN_CONFIDENCE": "0",
     "NOTIFY_REVIEW_ACTIONS": "true",
+    "NOTIFY_AI_FAILURES": "true",
     "SEND_IMAGE_CONTENT_TO_MODEL": "false",
     "MAX_IMAGES_FOR_MODEL": "3",
     "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW": "false",
@@ -1336,6 +1339,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         notify_review_checkbox = _checkbox(
             "NOTIFY_REVIEW_ACTIONS", values, "Send reviews to Telegram"
         )
+        notify_ai_failure_checkbox = _checkbox(
+            "NOTIFY_AI_FAILURES", values, "Send production AI-failure alerts to Telegram"
+        )
         send_images_checkbox = _checkbox(
             "SEND_IMAGE_CONTENT_TO_MODEL", values, "Allow model to inspect listing images"
         )
@@ -1370,6 +1376,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                         </div>
                         <div class="checks">
                                                         {notify_review_checkbox}
+                                                        {notify_ai_failure_checkbox}
                         </div>
                     </fieldset>
 

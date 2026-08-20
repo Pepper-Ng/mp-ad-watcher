@@ -7,7 +7,13 @@ from typing import Any
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
-from marktplaats_ad_watcher.models import Ad, EvaluatedAd, EvaluationResult, TelegramSendResult
+from marktplaats_ad_watcher.models import (
+    Ad,
+    EvaluatedAd,
+    EvaluationFailure,
+    EvaluationResult,
+    TelegramSendResult,
+)
 from marktplaats_ad_watcher.runner import Watcher
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatusStore
@@ -52,10 +58,18 @@ class RecordingEvaluator:
 class FakeNotifier:
     def __init__(self) -> None:
         self.sent_ads: list[str] = []
+        self.ai_failure_alerts: list[list[EvaluationFailure]] = []
 
     async def send(self, evaluated_ad: Any) -> TelegramSendResult:
         self.sent_ads.append(evaluated_ad.ad.id)
         return TelegramSendResult(sent=True, message_id=1)
+
+    async def send_ai_failure_alert(
+        self,
+        failures: list[EvaluationFailure],
+    ) -> TelegramSendResult:
+        self.ai_failure_alerts.append(failures)
+        return TelegramSendResult(sent=True, message_id=2)
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -172,8 +186,9 @@ async def test_production_notification_payload_includes_profile_metadata(tmp_pat
         )
     )
 
-    class CapturingNotifier:
+    class CapturingNotifier(FakeNotifier):
         def __init__(self) -> None:
+            super().__init__()
             self.sent: list[EvaluatedAd] = []
 
         async def send(self, evaluated_ad: Any) -> TelegramSendResult:
@@ -273,7 +288,7 @@ async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: P
         )
     )
 
-    class FailingNotifier:
+    class FailingNotifier(FakeNotifier):
         async def send(self, evaluated_ad: Any) -> TelegramSendResult:
             del evaluated_ad
             raise RuntimeError("Telegram unavailable")
@@ -329,3 +344,83 @@ async def test_evaluation_failure_remains_pending_and_is_reported(tmp_path: Path
     assert not store.has_seen("m-pending")
     status = RuntimeStatusStore(settings.status_file).read()
     assert status.total_evaluation_failed == 1
+
+
+@pytest.mark.asyncio
+async def test_production_model_failure_sends_one_deduplicated_telegram_alert(
+    tmp_path: Path,
+) -> None:
+    class FailingEvaluator:
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            del ad
+            raise RuntimeError("Model provider returned HTTP 503 (request id: changing-value).")
+
+    settings = _settings(tmp_path)
+    status_store = RuntimeStatusStore(settings.status_file)
+    notifier = FakeNotifier()
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=FakeMarktplaatsClient(
+            [Ad(id="m-pending", title="Pending freezer", url="https://example.test/pending")]
+        ),
+        evaluator=FailingEvaluator(),
+        notifier=notifier,
+        store=SeenStore(settings.state_file),
+        status_store=status_store,
+    )
+
+    await watcher.run_once()
+    await watcher.run_once()
+
+    assert len(notifier.ai_failure_alerts) == 1
+    assert notifier.ai_failure_alerts[0][0].ad_id == "m-pending"
+    assert notifier.ai_failure_alerts[0][0].stage == "model"
+    assert RuntimeStatusStore(settings.status_file).read().last_ai_failure_alert_at is not None
+
+
+@pytest.mark.asyncio
+async def test_disabled_or_non_model_failure_does_not_send_ai_failure_alert(tmp_path: Path) -> None:
+    class FailingEvaluator:
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            del ad
+            raise RuntimeError("Provider unavailable")
+
+    disabled_settings = _settings(tmp_path / "disabled", notify_ai_failures=False)
+    disabled_notifier = FakeNotifier()
+    disabled_watcher = Watcher(
+        settings=disabled_settings,
+        marktplaats_client=FakeMarktplaatsClient(
+            [Ad(id="m1", title="Pending", url="https://example.test/m1")]
+        ),
+        evaluator=FailingEvaluator(),
+        notifier=disabled_notifier,
+        store=SeenStore(disabled_settings.state_file),
+        status_store=RuntimeStatusStore(disabled_settings.status_file),
+    )
+
+    await disabled_watcher.run_once()
+
+    assert disabled_notifier.ai_failure_alerts == []
+
+    detail_settings = _settings(tmp_path / "detail")
+    detail_notifier = FakeNotifier()
+
+    class DetailFailureClient(FakeMarktplaatsClient):
+        async def enrich_ad(self, ad: Ad) -> Ad:
+            del ad
+            raise RuntimeError("Listing page unavailable")
+
+    detail_watcher = Watcher(
+        settings=detail_settings,
+        marktplaats_client=DetailFailureClient(
+            [Ad(id="m2", title="Details fail", url="https://example.test/m2")]
+        ),
+        evaluator=RecordingEvaluator(),
+        notifier=detail_notifier,
+        store=SeenStore(detail_settings.state_file),
+        status_store=RuntimeStatusStore(detail_settings.status_file),
+    )
+
+    await detail_watcher.run_once()
+
+    assert detail_notifier.ai_failure_alerts == []

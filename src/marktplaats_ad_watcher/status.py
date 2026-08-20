@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,8 @@ class RuntimeStatus(BaseModel):
     total_reviewed: int = 0
     total_notify_actions: int = 0
     total_evaluation_failed: int = 0
+    last_ai_failure_alert_signature: str | None = None
+    last_ai_failure_alert_at: datetime | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -61,6 +65,9 @@ class RuntimeStatusStore:
         self._status.total_reviewed += summary.review_count
         self._status.total_notify_actions += summary.notify_action_count
         self._status.total_evaluation_failed += summary.evaluation_failed_count
+        if not _model_failure_signature(summary):
+            self._status.last_ai_failure_alert_signature = None
+            self._status.last_ai_failure_alert_at = None
         self._touch()
 
     def mark_failed(self, error: Exception) -> None:
@@ -86,6 +93,18 @@ class RuntimeStatusStore:
         self._touch()
         return True
 
+    def should_send_ai_failure_alert(self, summary: WatcherRunSummary) -> bool:
+        signature = _model_failure_signature(summary)
+        return bool(signature and signature != self._status.last_ai_failure_alert_signature)
+
+    def mark_ai_failure_alert_sent(self, summary: WatcherRunSummary) -> None:
+        signature = _model_failure_signature(summary)
+        if not signature:
+            return
+        self._status.last_ai_failure_alert_signature = signature
+        self._status.last_ai_failure_alert_at = datetime.now(UTC)
+        self._touch()
+
     def _load(self) -> RuntimeStatus:
         if not self._path.exists():
             return RuntimeStatus()
@@ -109,3 +128,21 @@ class RuntimeStatusStore:
             output.write("\n")
 
         temporary_path.replace(self._path)
+
+
+def _model_failure_signature(summary: WatcherRunSummary) -> str | None:
+    model_failures = [
+        failure for failure in summary.evaluation_failures if failure.stage == "model"
+    ]
+    if not model_failures:
+        return None
+
+    parts = [
+        f"{failure.ad_id}|{_stable_error_text(failure.error)}"
+        for failure in sorted(model_failures, key=lambda failure: failure.ad_id)
+    ]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _stable_error_text(value: str) -> str:
+    return re.sub(r"\s*\(request id: [^)]+\)", "", value, flags=re.IGNORECASE).strip()

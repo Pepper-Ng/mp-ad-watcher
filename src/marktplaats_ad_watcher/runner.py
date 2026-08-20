@@ -205,6 +205,8 @@ class Watcher:
         if self._status_store is not None:
             self._status_store.mark_finished(summary)
 
+        await self._notify_production_ai_failures(summary)
+
         return summary
 
     async def _run_once(self) -> WatcherRunSummary:
@@ -273,6 +275,7 @@ class Watcher:
                         title=ad.title,
                         url=ad.url,
                         error=_evaluation_failure_message(error),
+                        stage="listing_details",
                     )
                 )
                 continue
@@ -380,6 +383,47 @@ class Watcher:
 
     async def _enrich_ad(self, ad: Ad) -> Ad:
         return await self._marktplaats_client.enrich_ad(ad)
+
+    async def _notify_production_ai_failures(self, summary: WatcherRunSummary) -> None:
+        if (
+            self._settings.dry_run
+            or not self._settings.notify_ai_failures
+            or self._status_store is None
+            or not self._status_store.should_send_ai_failure_alert(summary)
+        ):
+            return
+
+        failures = [failure for failure in summary.evaluation_failures if failure.stage == "model"]
+        sender = getattr(self._notifier, "send_ai_failure_alert", None)
+        if not callable(sender):
+            LOGGER.warning(
+                "%sNotifier does not support production AI-failure alerts.",
+                self._profile_log_context,
+            )
+            return
+
+        try:
+            send_result = await sender(failures)
+        except Exception:
+            LOGGER.exception(
+                "%sTelegram AI-failure alert could not be sent; it will retry on the next run.",
+                self._profile_log_context,
+            )
+            return
+
+        if send_result.sent:
+            self._status_store.mark_ai_failure_alert_sent(summary)
+            LOGGER.info(
+                "%sSent Telegram AI-failure alert for %s pending listing(s).",
+                self._profile_log_context,
+                len(failures),
+            )
+        else:
+            LOGGER.info(
+                "%sSkipped Telegram AI-failure alert: %s.",
+                self._profile_log_context,
+                send_result.reason,
+            )
 
     async def run_loop(self) -> None:
         while True:

@@ -7,8 +7,18 @@ from typing import Any
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
-from marktplaats_ad_watcher.models import Ad, EvaluatedAd, EvaluationResult, TelegramSendResult
-from marktplaats_ad_watcher.telegram import TelegramNotifier, _format_message
+from marktplaats_ad_watcher.models import (
+    Ad,
+    EvaluatedAd,
+    EvaluationFailure,
+    EvaluationResult,
+    TelegramSendResult,
+)
+from marktplaats_ad_watcher.telegram import (
+    TelegramNotifier,
+    _format_ai_failure_alert,
+    _format_message,
+)
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -157,3 +167,23 @@ async def test_standalone_message_uses_active_profile_defaults(
 
     assert result.sent is True
     assert "<b>[Freezers · freezers] Marktplaats Ad Watcher test</b>" in captured["text"]
+
+
+def test_ai_failure_alert_labels_and_escapes_listing_data() -> None:
+    message = _format_ai_failure_alert(
+        [
+            EvaluationFailure(
+                ad_id="m1",
+                title="Freezer <broken>",
+                url="https://example.test/?a=1&b=2",
+                error="Model <unavailable>",
+            )
+        ],
+        profile_id="freezers",
+        profile_name="Freezers & keezer",
+    )
+
+    assert "[Freezers &amp; keezer · freezers] AI evaluation needs attention" in message
+    assert "Freezer &lt;broken&gt;" in message
+    assert "Model &lt;unavailable&gt;" in message
+    assert "remain pending and will retry automatically" in message

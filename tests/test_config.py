@@ -41,6 +41,13 @@ def test_deepseek_remains_the_backwards_compatible_default() -> None:
     assert settings.model_api_key == "legacy-key"
     assert settings.model_base_url == "https://api.deepseek.com/v1"
     assert settings.model_name == "deepseek-v4-flash"
+    assert settings.notify_ai_failures is True
+
+
+def test_ai_failure_telegram_alerts_can_be_disabled() -> None:
+    settings = Settings.from_environment(_environment(NOTIFY_AI_FAILURES="false"))
+
+    assert settings.notify_ai_failures is False
 
 
 def test_legacy_deepseek_values_are_migrated() -> None:

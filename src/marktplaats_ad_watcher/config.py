@@ -48,6 +48,7 @@ class Settings:
     persistent_data_root: Path | None = None
     active_profile_id: str | None = None
     active_profile_name: str | None = None
+    notify_ai_failures: bool = True
 
     def __post_init__(self) -> None:
         preset = provider_preset(self.model_provider)
@@ -194,6 +195,7 @@ class Settings:
             ),
             web_admin_token=_optional(values, "WEB_ADMIN_TOKEN"),
             dry_run=dry_run,
+            notify_ai_failures=_bool(values, "NOTIFY_AI_FAILURES", True),
         )
 
 

@@ -98,6 +98,7 @@ class EvaluationFailure(BaseModel):
     title: str
     url: str
     error: str
+    stage: Literal["model", "listing_details"] = "model"
 
 
 class WatcherRunSummary(BaseModel):
