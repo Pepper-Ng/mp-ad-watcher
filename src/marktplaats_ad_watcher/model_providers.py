@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -65,12 +66,27 @@ class HttpModelEvaluator(ABC):
         except Exception:
             reservation.release()
             raise
-        reservation.commit()
 
-        response_payload = response.json()
-        if not isinstance(response_payload, dict):
-            raise ValueError("Model response was not a JSON object at the protocol level.")
-        response_text = self.response_text(response_payload)
+        response_payload: dict[str, Any] | None = None
+        try:
+            parsed_payload = response.json()
+            if not isinstance(parsed_payload, dict):
+                raise ValueError("Model response was not a JSON object at the protocol level.")
+            response_payload = parsed_payload
+            response_text = self.response_text(response_payload)
+            result = parse_evaluation(response_text)
+        except Exception:
+            LOGGER.warning(
+                "%sModel response could not be parsed into a valid evaluation for ad %s; "
+                "releasing its model-budget reservation.",
+                _profile_log_context(self._settings),
+                ad.id,
+                extra={"diagnostic_detail": _diagnostic_response_payload(response_payload)},
+            )
+            reservation.release()
+            raise
+
+        reservation.commit()
         profile_context = _profile_log_context(self._settings)
         LOGGER.info(
             "%sModel response received for ad %s.",
@@ -78,7 +94,7 @@ class HttpModelEvaluator(ABC):
             ad.id,
             extra={"diagnostic_detail": response_text[:8000]},
         )
-        return parse_evaluation(response_text)
+        return result
 
     @abstractmethod
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
@@ -132,16 +148,43 @@ class OpenAICompatibleEvaluator(HttpModelEvaluator):
 
     def response_text(self, response_payload: dict[str, Any]) -> str:
         try:
-            content = response_payload["choices"][0]["message"]["content"]
+            choice = response_payload["choices"][0]
+            message = choice["message"]
         except (KeyError, IndexError, TypeError) as error:
             raise ValueError(
                 f"Unexpected OpenAI-compatible response shape: {response_payload}"
             ) from error
-        if not isinstance(content, str):
-            raise ValueError(
-                f"Unexpected OpenAI-compatible assistant content type: {type(content).__name__}"
-            )
-        return content
+
+        content = message.get("content") if isinstance(message, dict) else None
+        text = _message_text(content)
+        if text:
+            return text
+
+        if isinstance(message, dict):
+            for field in ("text", "output_text"):
+                text = _message_text(message.get(field))
+                if text:
+                    return text
+
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and _contains_json_object(reasoning):
+                return reasoning
+
+        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        reasoning_present = bool(
+            isinstance(message, dict)
+            and isinstance(message.get("reasoning_content"), str)
+            and message["reasoning_content"].strip()
+        )
+        hint = (
+            " The response contains reasoning text but no final answer."
+            if reasoning_present
+            else ""
+        )
+        raise ValueError(
+            "Model returned no final assistant content"
+            f" (finish_reason={finish_reason!r}).{hint}"
+        )
 
 
 class OpenAIResponsesEvaluator(HttpModelEvaluator):
@@ -314,6 +357,35 @@ def _provider_error_details(response: httpx.Response) -> tuple[str | None, str]:
             if isinstance(raw_message, str) and raw_message.strip():
                 message = raw_message.strip()
     return code, message[:500]
+
+
+def _message_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    if not isinstance(value, list):
+        return None
+
+    parts = [
+        block["text"]
+        for block in value
+        if isinstance(block, dict)
+        and isinstance(block.get("text"), str)
+        and block["text"].strip()
+    ]
+    return "".join(parts) if parts else None
+
+
+def _contains_json_object(value: str) -> bool:
+    return "{" in value and "}" in value
+
+
+def _diagnostic_response_payload(payload: dict[str, Any] | None) -> str:
+    if payload is None:
+        return "No JSON response payload was available."
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)[:8000]
+    except (TypeError, ValueError):
+        return repr(payload)[:8000]
 
 
 def _profile_log_context(settings: Settings) -> str:

@@ -394,6 +394,144 @@ async def test_model_evaluator_enforces_daily_budget_before_outbound_call(
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_malformed_model_json_is_repaired_and_counts_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"relevant":false,"confidence":0.85,'
+                                    '"reason":"Broken freezer.",signals:["broken"],'
+                                    '"concerns":[],"next_action":"ignore"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    settings = _settings(tmp_path)
+
+    result = await OpenAICompatibleEvaluator(settings).evaluate(_ad())
+
+    assert result.next_action == "ignore"
+    usage = ModelUsageStore(settings.global_model_usage_file).snapshot()
+    assert usage.used == 1
+    assert usage.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_qwen_reasoning_json_is_accepted_when_final_content_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": None,
+                                "reasoning_content": (
+                                    "Final evaluation: {\"relevant\":true,\"confidence\":0.8,"
+                                    "\"reason\":\"Good size.\",\"signals\":[],"
+                                    "\"concerns\":[],\"next_action\":\"notify\"}"
+                                ),
+                            },
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+
+    result = await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
+
+    assert result.next_action == "notify"
+
+
+@pytest.mark.asyncio
+async def test_missing_final_content_releases_quota_and_logs_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": None,
+                                "reasoning_content": "The response stopped before its final JSON.",
+                            },
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    caplog.set_level(logging.WARNING, logger="marktplaats_ad_watcher.model_providers")
+    settings = _settings(tmp_path)
+
+    with pytest.raises(ValueError, match="no final assistant content"):
+        await OpenAICompatibleEvaluator(settings).evaluate(_ad())
+
+    usage = ModelUsageStore(settings.global_model_usage_file).snapshot()
+    assert usage.used == 0
+    assert usage.in_flight == 0
+    details = [getattr(record, "diagnostic_detail", "") for record in caplog.records]
+    assert any('"content": null' in detail for detail in details)
+
+
 def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> None:
     expected = (
         '{"relevant":false,"confidence":0.2,"reason":"No match.",'

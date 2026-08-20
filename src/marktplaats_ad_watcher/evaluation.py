@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from json_repair import loads as repair_json_loads
+
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
+
+LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You evaluate Marktplaats classified ads for one private buyer. "
@@ -123,7 +128,12 @@ def parse_json_object(content: str) -> dict[str, Any]:
         end = stripped.rfind("}")
         if start < 0 or end <= start:
             raise
-        parsed = json.loads(stripped[start : end + 1])
+        candidate = stripped[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = repair_json_loads(candidate)
+            LOGGER.warning("Repaired malformed JSON returned by the model before validation.")
 
     if not isinstance(parsed, dict):
         raise ValueError("Model response was not a JSON object.")
