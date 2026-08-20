@@ -166,15 +166,18 @@ class OpenAICompatibleEvaluator(HttpModelEvaluator):
                 if text:
                     return text
 
-            reasoning = message.get("reasoning_content")
-            if isinstance(reasoning, str) and _contains_json_object(reasoning):
-                return reasoning
+            for field in ("reasoning_content", "reasoning"):
+                reasoning = message.get(field)
+                if isinstance(reasoning, str) and _contains_json_object(reasoning):
+                    return reasoning
 
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
         reasoning_present = bool(
             isinstance(message, dict)
-            and isinstance(message.get("reasoning_content"), str)
-            and message["reasoning_content"].strip()
+            and any(
+                isinstance(message.get(field), str) and message[field].strip()
+                for field in ("reasoning_content", "reasoning")
+            )
         )
         hint = (
             " The response contains reasoning text but no final answer."

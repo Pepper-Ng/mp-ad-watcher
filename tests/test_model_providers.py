@@ -466,7 +466,7 @@ async def test_qwen_reasoning_json_is_accepted_when_final_content_is_empty(
                             "finish_reason": "stop",
                             "message": {
                                 "content": None,
-                                "reasoning_content": (
+                                "reasoning": (
                                     "Final evaluation: {\"relevant\":true,\"confidence\":0.8,"
                                     "\"reason\":\"Good size.\",\"signals\":[],"
                                     "\"concerns\":[],\"next_action\":\"notify\"}"
