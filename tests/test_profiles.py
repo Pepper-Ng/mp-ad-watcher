@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -102,6 +103,24 @@ def test_profile_registry_rejects_invalid_profile_values_and_duplicate_ids() -> 
     )
     with pytest.raises(ProfileConfigurationError, match="duplicate profile IDs"):
         ProfileRegistry(default_profile_id="freezers", profiles=(profile, profile))
+
+
+def test_profile_search_url_defaults_ui_sort_when_missing() -> None:
+    profile = SearchProfile(
+        id="freezers",
+        name="Freezers",
+        search_url=(
+            "https://www.marktplaats.nl/lrp/api/search?"
+            "limit=30&offset=0&query=vrieskist&postcode=6005JW&"
+            "distanceMeters=30000&searchInTitleAndDescription=true"
+        ),
+        use_case="Find freezer chests.",
+    )
+
+    parsed = urlsplit(profile.search_url)
+    params = parse_qs(parsed.query)
+    assert params["sortBy"] == ["SORT_INDEX"]
+    assert params["sortOrder"] == ["DECREASING"]
 
 
 def test_migration_copies_legacy_data_with_verified_manifest_and_global_quota(

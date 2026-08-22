@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from marktplaats_ad_watcher.search_url import normalize_marktplaats_search_url
+
 if TYPE_CHECKING:
     from marktplaats_ad_watcher.config import Settings
 
@@ -55,7 +57,9 @@ class SearchProfile:
         _validate_profile_id(self.id)
         if not isinstance(self.name, str) or not self.name.strip():
             raise ProfileConfigurationError("Profile name must not be empty.")
-        _validate_http_url("Profile search URL", self.search_url)
+        normalized_search_url = normalize_marktplaats_search_url(self.search_url)
+        object.__setattr__(self, "search_url", normalized_search_url)
+        _validate_http_url("Profile search URL", normalized_search_url)
         if not isinstance(self.use_case, str) or not self.use_case.strip():
             raise ProfileConfigurationError("Profile evaluation instructions must not be empty.")
         if not isinstance(self.enabled, bool):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
@@ -91,3 +93,39 @@ def test_settings_reject_unknown_provider_and_reasoning_effort() -> None:
 
     with pytest.raises(ValueError, match="MODEL_REASONING_EFFORT"):
         Settings.from_environment(_environment(MODEL_REASONING_EFFORT="enormous"))
+
+
+def test_marktplaats_search_url_defaults_ui_sort_when_missing() -> None:
+    settings = Settings.from_environment(
+        _environment(
+            MARKTPLAATS_SEARCH_URL=(
+                "https://www.marktplaats.nl/lrp/api/search?"
+                "limit=30&offset=0&query=vrieskist&postcode=6005JW&"
+                "distanceMeters=30000&searchInTitleAndDescription=true"
+            )
+        )
+    )
+
+    parsed = urlsplit(settings.marktplaats_search_url)
+    params = parse_qs(parsed.query)
+    assert params["sortBy"] == ["SORT_INDEX"]
+    assert params["sortOrder"] == ["DECREASING"]
+
+
+def test_marktplaats_query_route_is_converted_to_search_endpoint() -> None:
+    settings = Settings.from_environment(
+        _environment(
+            MARKTPLAATS_SEARCH_URL=(
+                "https://www.marktplaats.nl/q/vrieskist/"
+                "#sortBy:SORT_INDEX|sortOrder:DECREASING|distanceMeters:30000|postcode:6005JW"
+            )
+        )
+    )
+
+    parsed = urlsplit(settings.marktplaats_search_url)
+    params = parse_qs(parsed.query)
+    assert parsed.path == "/lrp/api/search"
+    assert params["query"] == ["vrieskist"]
+    assert params["distanceMeters"] == ["30000"]
+    assert params["postcode"] == ["6005JW"]
+    assert params["searchInTitleAndDescription"] == ["true"]

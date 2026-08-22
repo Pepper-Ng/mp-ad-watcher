@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from marktplaats_ad_watcher.model_config import REASONING_EFFORTS, provider_preset
+from marktplaats_ad_watcher.search_url import normalize_marktplaats_search_url
 
 if TYPE_CHECKING:
     from marktplaats_ad_watcher.profiles import SearchProfile
@@ -51,8 +52,10 @@ class Settings:
     notify_ai_failures: bool = True
 
     def __post_init__(self) -> None:
+        normalized_search_url = normalize_marktplaats_search_url(self.marktplaats_search_url)
+        object.__setattr__(self, "marktplaats_search_url", normalized_search_url)
         preset = provider_preset(self.model_provider)
-        _validate_url("MARKTPLAATS_SEARCH_URL", self.marktplaats_search_url)
+        _validate_url("MARKTPLAATS_SEARCH_URL", normalized_search_url)
         _validate_url("MODEL_BASE_URL", self.model_base_url)
         _validate_range("POLL_INTERVAL_SECONDS", self.poll_interval_seconds, minimum=1)
         _validate_range("MAX_ADS_PER_POLL", self.max_ads_per_poll, minimum=1, maximum=100)
