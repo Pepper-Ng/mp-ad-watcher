@@ -27,6 +27,7 @@ from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatusStore
 
 LOGGER = logging.getLogger(__name__)
+MAX_MODEL_RETRIES = 2
 
 
 class AdFetcher(Protocol):
@@ -283,6 +284,18 @@ class Watcher:
             try:
                 result = await self._evaluator.evaluate(enriched_ad)
             except Exception as error:
+                failure_message = _evaluation_failure_message(error)
+                attempt_number = self._store.model_failure_attempts(enriched_ad.id) + 1
+                LOGGER.warning(
+                    (
+                        "%sModel evaluation failed for ad %s (%s), attempt %s of %s."
+                    ),
+                    self._profile_log_context,
+                    enriched_ad.id,
+                    enriched_ad.title,
+                    attempt_number,
+                    MAX_MODEL_RETRIES + 1,
+                )
                 LOGGER.exception(
                     "%sFailed to evaluate ad %s (%s).",
                     self._profile_log_context,
@@ -294,9 +307,26 @@ class Watcher:
                         ad_id=enriched_ad.id,
                         title=enriched_ad.title,
                         url=enriched_ad.url,
-                        error=_evaluation_failure_message(error),
+                        error=failure_message,
                     )
                 )
+
+                if not self._settings.dry_run:
+                    failed_attempts, exhausted = self._store.mark_model_failure(
+                        enriched_ad,
+                        error=failure_message,
+                        max_retries=MAX_MODEL_RETRIES,
+                    )
+                    if exhausted:
+                        LOGGER.warning(
+                            (
+                                "%sGiving up on ad %s after %s failed model attempts; "
+                                "it will not be retried again."
+                            ),
+                            self._profile_log_context,
+                            enriched_ad.id,
+                            failed_attempts,
+                        )
                 continue
 
             evaluated_ad = EvaluatedAd(

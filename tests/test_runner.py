@@ -313,7 +313,7 @@ async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_evaluation_failure_remains_pending_and_is_reported(tmp_path: Path) -> None:
+async def test_evaluation_failure_retries_then_stops_after_retry_budget(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
     class FailingEvaluator:
@@ -334,16 +334,32 @@ async def test_evaluation_failure_remains_pending_and_is_reported(tmp_path: Path
         status_store=status_store,
     )
 
-    summary = await watcher.run_once()
-
-    assert summary.new_count == 1
-    assert summary.evaluated_count == 0
-    assert summary.evaluation_failed_count == 1
-    assert summary.evaluation_failures[0].ad_id == "m-pending"
-    assert "free_rate_limited" in summary.evaluation_failures[0].error
+    first = await watcher.run_once()
+    assert first.new_count == 1
+    assert first.evaluated_count == 0
+    assert first.evaluation_failed_count == 1
+    assert first.evaluation_failures[0].ad_id == "m-pending"
+    assert "free_rate_limited" in first.evaluation_failures[0].error
     assert not store.has_seen("m-pending")
+
+    second = await watcher.run_once()
+    assert not store.has_seen("m-pending")
+
+    assert second.new_count == 1
+    assert second.evaluation_failed_count == 1
+    assert not store.has_seen("m-pending")
+
+    third = await watcher.run_once()
+    assert third.new_count == 1
+    assert third.evaluation_failed_count == 1
+    assert store.has_seen("m-pending")
+
+    fourth = await watcher.run_once()
+    assert fourth.new_count == 0
+    assert fourth.evaluation_failed_count == 0
+
     status = RuntimeStatusStore(settings.status_file).read()
-    assert status.total_evaluation_failed == 1
+    assert status.total_evaluation_failed == 3
 
 
 @pytest.mark.asyncio
@@ -371,11 +387,14 @@ async def test_production_model_failure_sends_one_deduplicated_telegram_alert(
 
     await watcher.run_once()
     await watcher.run_once()
+    await watcher.run_once()
+    await watcher.run_once()
 
     assert len(notifier.ai_failure_alerts) == 1
     assert notifier.ai_failure_alerts[0][0].ad_id == "m-pending"
     assert notifier.ai_failure_alerts[0][0].stage == "model"
-    assert RuntimeStatusStore(settings.status_file).read().last_ai_failure_alert_at is not None
+    status = RuntimeStatusStore(settings.status_file).read()
+    assert status.last_ai_failure_alert_signature is None
 
 
 @pytest.mark.asyncio
