@@ -397,6 +397,87 @@ async def test_fallback_model_is_used_when_primary_model_fails(
 
 
 @pytest.mark.asyncio
+async def test_fallback_model_can_reuse_primary_provider_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, str, str]] = []
+
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(
+            self,
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            requests.append((endpoint, headers["Authorization"], json["model"]))
+            if json["model"] == "cheap-model":
+                return httpx.Response(
+                    503,
+                    request=httpx.Request("POST", endpoint),
+                    json={"error": {"message": "upstream unavailable"}},
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"relevant":false,"confidence":0.2,'
+                                    '"reason":"Inherited connection succeeded.","signals":[],'
+                                    '"concerns":[],"next_action":"ignore"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    evaluator = build_model_evaluator(
+        _settings(
+            tmp_path,
+            model_provider="openai-compatible",
+            model_api_key="primary-key",
+            model_base_url="https://primary.example.test/v1",
+            model_name="cheap-model",
+            model_json_mode=False,
+            fallback_model_enabled=True,
+            fallback_model_use_base_provider=True,
+            fallback_model_provider="anthropic",
+            fallback_model_api_key="other-key",
+            fallback_model_base_url="https://other.example.test",
+            fallback_model_name="reliable-model",
+            fallback_model_json_mode=False,
+        )
+    )
+
+    result = await evaluator.evaluate(_ad())
+
+    assert result.reason == "Inherited connection succeeded."
+    assert requests == [
+        ("https://primary.example.test/v1/chat/completions", "Bearer primary-key", "cheap-model"),
+        (
+            "https://primary.example.test/v1/chat/completions",
+            "Bearer primary-key",
+            "reliable-model",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_transport_error_retries_once_before_failing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -77,6 +77,7 @@ EDITABLE_KEYS = [
     "MODEL_REASONING_EFFORT",
     "MODEL_JSON_MODE",
     "FALLBACK_MODEL_ENABLED",
+    "FALLBACK_MODEL_USE_BASE_PROVIDER",
     "FALLBACK_MODEL_PROVIDER",
     "FALLBACK_MODEL_API_KEY",
     "FALLBACK_MODEL_BASE_URL",
@@ -105,6 +106,7 @@ BOOLEAN_KEYS = {
     "NOTIFY_AI_FAILURES",
     "MODEL_JSON_MODE",
     "FALLBACK_MODEL_ENABLED",
+    "FALLBACK_MODEL_USE_BASE_PROVIDER",
     "FALLBACK_MODEL_JSON_MODE",
     "SEND_IMAGE_CONTENT_TO_MODEL",
     "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW",
@@ -133,6 +135,7 @@ CONFIG_DEFAULTS = {
     "NOTIFY_REVIEW_ACTIONS": "true",
     "NOTIFY_AI_FAILURES": "true",
     "FALLBACK_MODEL_ENABLED": "false",
+    "FALLBACK_MODEL_USE_BASE_PROVIDER": "false",
     "FALLBACK_MODEL_TEMPERATURE": "0",
     "FALLBACK_MODEL_MAX_TOKENS": "700",
     "FALLBACK_MODEL_JSON_MODE": "false",
@@ -1379,6 +1382,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         fallback_enabled_checkbox = _checkbox(
             "FALLBACK_MODEL_ENABLED", values, "Enable fallback model"
         )
+        fallback_use_base_provider_checkbox = _checkbox(
+            "FALLBACK_MODEL_USE_BASE_PROVIDER",
+            values,
+            "Use base provider",
+            element_id="fallback-use-base-provider",
+        )
         fallback_json_checkbox = _checkbox(
             "FALLBACK_MODEL_JSON_MODE", values, "Structured JSON output for fallback"
         )
@@ -1447,8 +1456,12 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                             <summary>Fallback model</summary>
                             <div class="checks">
                                 {fallback_enabled_checkbox}
+                                {fallback_use_base_provider_checkbox}
                             </div>
-                            <div class="grid advanced-grid">
+                            <p id="fallback-use-base-help" class="hint">When selected, the fallback
+                            inherits the primary provider, API key, and base URL. Configure only its
+                            model-specific parameters below.</p>
+                            <div id="fallback-provider-settings" class="grid advanced-grid">
                                 {_provider_select(
                                     values,
                                     field_name="FALLBACK_MODEL_PROVIDER",
@@ -1538,6 +1551,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         current = service.read_config()
         file_values = parse_dotenv(service.env_file)
+        fallback_uses_base_provider = "FALLBACK_MODEL_USE_BASE_PROVIDER" in form
         submitted_provider = form.get("MODEL_PROVIDER", [current.get("MODEL_PROVIDER", "")])[
             0
         ].strip().lower()
@@ -1553,8 +1567,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 _page("Invalid configuration", f"<p>{escape(str(error))}</p>"),
                 status_code=400,
             )
-        fallback_preset = None
-        if submitted_fallback_provider:
+        fallback_preset = preset if fallback_uses_base_provider else None
+        if not fallback_uses_base_provider and submitted_fallback_provider:
             try:
                 fallback_preset = provider_preset(submitted_fallback_provider)
             except ValueError as error:
@@ -3061,6 +3075,8 @@ def _provider_defaults_script() -> str:
             const jsonModeInput = document.querySelector('[name="MODEL_JSON_MODE"]');
             const providerHelp = document.getElementById("provider-help");
             const advancedSettings = document.querySelector("details.advanced");
+            const fallbackUseBaseProvider = document.getElementById("fallback-use-base-provider");
+            const fallbackProviderSettings = document.getElementById("fallback-provider-settings");
 
             function applyProvider(resetDefaults) {{
                 const defaults = providerDefaults[providerSelect.value];
@@ -3103,11 +3119,31 @@ def _provider_defaults_script() -> str:
 
             providerSelect.addEventListener("change", () => applyProvider(true));
             reasoningSelect.addEventListener("change", () => applyProvider(false));
+            function applyFallbackProviderMode() {{
+                const useBaseProvider = fallbackUseBaseProvider.checked;
+                fallbackProviderSettings.hidden = useBaseProvider;
+                for (const input of fallbackProviderSettings.querySelectorAll("input, select")) {{
+                    input.disabled = useBaseProvider;
+                }}
+            }}
+
+            fallbackUseBaseProvider.addEventListener("change", applyFallbackProviderMode);
             applyProvider(false);
+            applyFallbackProviderMode();
     </script>
     """
 
 
-def _checkbox(key: str, values: Mapping[str, str], label: str) -> str:
+def _checkbox(
+    key: str,
+    values: Mapping[str, str],
+    label: str,
+    *,
+    element_id: str | None = None,
+) -> str:
     checked = " checked" if values.get(key, "").lower() in {"1", "true", "yes", "on"} else ""
-    return f"<label><input type='checkbox' name='{key}'{checked}> {escape(label)}</label>"
+    id_attribute = f" id='{escape(element_id)}'" if element_id else ""
+    return (
+        f"<label><input type='checkbox' name='{key}'{id_attribute}{checked}> "
+        f"{escape(label)}</label>"
+    )

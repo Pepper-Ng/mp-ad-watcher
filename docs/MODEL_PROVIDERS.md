@@ -35,10 +35,8 @@ OpenAI-compatible provider. The remaining options are:
 - `MODEL_JSON_MODE`: asks the provider for structured JSON. Keep it enabled for presets. Disable it
   for a custom compatibility endpoint that rejects `response_format`; local Pydantic validation is
   always performed.
-- `SEND_IMAGE_CONTENT_TO_MODEL`: when enabled, sends image URLs using the chosen protocol's native
-  content-block shape and tells the model to inspect the attached images. It is disabled by
-  default; when disabled, no image URLs, image attachments, or image-specific instructions are
-  sent. Only enable it for a vision-capable model.
+- `SEND_IMAGE_CONTENT_TO_MODEL`: sends image URLs using the chosen protocol's native content-block
+  shape. Only enable it for a vision-capable model.
 - `MAX_IMAGES_FOR_MODEL`: caps the number of image inputs per ad.
 
 Not every advanced control applies to every provider. The web page hides and disables controls
@@ -76,9 +74,22 @@ the exception: it may come from the Portainer stack environment and is used with
 into the settings file unless the operator explicitly enters a new value in the form. CLI mode
 continues to support ordinary environment variables and `.env` loading.
 
-When profile-aware execution is active, model-response diagnostics include profile context in the
-log message prefix (for example `[Freezers · freezers]`). This keeps Diagnostics page filtering
-accurate without exposing provider secrets.
+## Fallback model
+
+Enable `FALLBACK_MODEL_ENABLED` to retry an evaluation with a second model after the primary
+model fails. It can be configured in either mode:
+
+- **Use base provider** (`FALLBACK_MODEL_USE_BASE_PROVIDER=true`): the fallback inherits
+  `MODEL_PROVIDER`, `MODEL_API_KEY`, and `MODEL_BASE_URL`. Configure only the fallback model name,
+  temperature, output-token limit, reasoning effort, and JSON mode. This is the preferred option
+  for a second model available through the same provider or router.
+- **Independent provider**: leave `FALLBACK_MODEL_USE_BASE_PROVIDER` disabled and configure
+  `FALLBACK_MODEL_PROVIDER`, `FALLBACK_MODEL_API_KEY`, and `FALLBACK_MODEL_BASE_URL` separately.
+  Use this when the backup model is hosted by a different provider.
+
+Switching to **Use base provider** does not erase saved independent fallback connection values;
+they are hidden and ignored while inheritance is selected, and become available again if it is
+disabled.
 
 ## Compatibility and migration
 

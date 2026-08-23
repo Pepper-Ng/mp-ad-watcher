@@ -59,6 +59,7 @@ class Settings:
     persistent_data_root: Path | None = None
     active_profile_id: str | None = None
     active_profile_name: str | None = None
+    fallback_model_use_base_provider: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -94,6 +95,10 @@ class Settings:
             raise ValueError(f"MODEL_REASONING_EFFORT must be one of: {supported}.")
         if not self.user_agent.strip():
             raise ValueError("USER_AGENT must not be empty.")
+        if self.fallback_model_use_base_provider:
+            object.__setattr__(self, "fallback_model_provider", self.model_provider)
+            object.__setattr__(self, "fallback_model_api_key", self.model_api_key)
+            object.__setattr__(self, "fallback_model_base_url", self.model_base_url)
         if self.fallback_model_enabled:
             if not self.fallback_model_provider:
                 raise ValueError("FALLBACK_MODEL_PROVIDER is required when fallback is enabled.")
@@ -188,6 +193,9 @@ class Settings:
         model_temperature = _optional(values, "MODEL_TEMPERATURE")
         model_max_tokens = _optional(values, "MODEL_MAX_TOKENS")
         fallback_model_enabled = _bool(values, "FALLBACK_MODEL_ENABLED", False)
+        fallback_model_use_base_provider = _bool(
+            values, "FALLBACK_MODEL_USE_BASE_PROVIDER", False
+        )
         fallback_model_provider = _optional(values, "FALLBACK_MODEL_PROVIDER")
         fallback_model_api_key = _optional(values, "FALLBACK_MODEL_API_KEY")
         fallback_model_base_url = _optional(values, "FALLBACK_MODEL_BASE_URL")
@@ -205,6 +213,11 @@ class Settings:
                 model_temperature = _optional(values, "DEEPSEEK_TEMPERATURE")
             if "MODEL_MAX_TOKENS" not in values:
                 model_max_tokens = _optional(values, "DEEPSEEK_MAX_TOKENS")
+
+        if fallback_model_use_base_provider:
+            fallback_model_provider = model_provider
+            fallback_model_api_key = model_api_key
+            fallback_model_base_url = model_base_url or preset.base_url
 
         reasoning_value = values.get("MODEL_REASONING_EFFORT", "").strip().lower()
         model_reasoning_effort = reasoning_value or preset.reasoning_effort
@@ -235,6 +248,7 @@ class Settings:
             model_json_mode=_bool(values, "MODEL_JSON_MODE", preset.json_mode),
             notify_ai_failures=_bool(values, "NOTIFY_AI_FAILURES", True),
             fallback_model_enabled=fallback_model_enabled,
+            fallback_model_use_base_provider=fallback_model_use_base_provider,
             fallback_model_provider=fallback_model_provider,
             fallback_model_api_key=fallback_model_api_key,
             fallback_model_base_url=(
