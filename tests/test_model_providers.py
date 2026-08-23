@@ -13,6 +13,7 @@ from marktplaats_ad_watcher.model_providers import (
     AnthropicMessagesEvaluator,
     FallbackEvaluator,
     ModelOutputError,
+    ModelTransportError,
     OpenAICompatibleEvaluator,
     OpenAIResponsesEvaluator,
     build_model_evaluator,
@@ -393,3 +394,91 @@ async def test_fallback_model_is_used_when_primary_model_fails(
     result = await evaluator.evaluate(_ad())
 
     assert result.reason == "Fallback succeeded."
+
+
+@pytest.mark.asyncio
+async def test_transport_error_retries_once_before_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(
+            self,
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            del headers, json
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                request = httpx.Request("POST", endpoint)
+                raise httpx.ReadTimeout("temporary timeout", request=request)
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"relevant":false,"confidence":0.2,'
+                                    '"reason":"Retried successfully.","signals":[],'
+                                    '"concerns":[],"next_action":"ignore"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+
+    result = await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
+
+    assert attempts == 2
+    assert result.reason == "Retried successfully."
+
+
+@pytest.mark.asyncio
+async def test_transport_error_reports_underlying_httpx_subtype(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(
+            self,
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            del headers, json
+            request = httpx.Request("POST", endpoint)
+            raise httpx.ConnectError("connection reset", request=request)
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+
+    with pytest.raises(ModelTransportError, match="ConnectError while calling"):
+        await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())

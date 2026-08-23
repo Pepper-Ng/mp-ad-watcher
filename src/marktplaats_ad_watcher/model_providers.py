@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -71,15 +72,29 @@ class HttpModelEvaluator(ABC):
         )
         endpoint, headers, payload = self.request(prompt)
         reservation = self._usage.acquire()
-        try:
-            async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
-                response = await client.post(endpoint, headers=headers, json=payload)
-        except httpx.RequestError as error:
+        response: httpx.Response | None = None
+        last_transport_error: httpx.RequestError | None = None
+        for _attempt in range(2):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.request_timeout_seconds
+                ) as client:
+                    response = await client.post(endpoint, headers=headers, json=payload)
+                last_transport_error = None
+                break
+            except httpx.RequestError as error:
+                last_transport_error = error
+                continue
+            except Exception:
+                reservation.release()
+                raise
+
+        if last_transport_error is not None:
             reservation.release()
-            raise ModelTransportError(str(error)) from error
-        except Exception:
-            reservation.release()
-            raise
+            raise ModelTransportError(
+                _transport_error_message(last_transport_error, endpoint)
+            ) from last_transport_error
+        assert response is not None
 
         try:
             response.raise_for_status()
@@ -364,3 +379,9 @@ class FallbackEvaluator:
 
 def _endpoint(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _transport_error_message(error: httpx.RequestError, endpoint: str) -> str:
+    host = urlsplit(endpoint).netloc or endpoint
+    detail = str(error).strip() or "No transport details were supplied."
+    return f"{type(error).__name__} while calling {host}: {detail}"
