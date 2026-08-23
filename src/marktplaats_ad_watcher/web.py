@@ -1389,7 +1389,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             element_id="fallback-use-base-provider",
         )
         fallback_json_checkbox = _checkbox(
-            "FALLBACK_MODEL_JSON_MODE", values, "Structured JSON output for fallback"
+            "FALLBACK_MODEL_JSON_MODE", values, "Structured JSON output"
         )
         disable_previews_checkbox = _checkbox(
             "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", values, "Disable previews"
@@ -1465,36 +1465,36 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                                 {_provider_select(
                                     values,
                                     field_name="FALLBACK_MODEL_PROVIDER",
-                                    label="Fallback provider",
+                                    label="Provider",
                                     element_id="fallback-provider",
                                 )}
                                 {_secret(
                                     "FALLBACK_MODEL_API_KEY",
                                     values,
-                                    label="Fallback API key",
+                                    label="API key",
                                 )}
                                 {_input(
                                     "FALLBACK_MODEL_BASE_URL",
                                     values,
-                                    label="Fallback base URL",
+                                    label="Base URL",
                                 )}
                             </div>
                             <div class="grid advanced-grid">
-                                {_input("FALLBACK_MODEL_NAME", values, label="Fallback model")}
+                                {_input("FALLBACK_MODEL_NAME", values, label="Model")}
                                 <div id="fallback-reasoning-field">{_input(
                                     "FALLBACK_MODEL_REASONING_EFFORT",
                                     values,
-                                    label="Fallback reasoning effort",
+                                    label="Reasoning effort",
                                 )}</div>
                                 <div id="fallback-temperature-field">{_input(
                                     "FALLBACK_MODEL_TEMPERATURE",
                                     values,
-                                    label="Fallback temperature",
+                                    label="Temperature",
                                 )}</div>
                                 {_input(
                                     "FALLBACK_MODEL_MAX_TOKENS",
                                     values,
-                                    label="Fallback output tokens",
+                                    label="Maximum output tokens",
                                 )}
                             </div>
                             <div class="checks">

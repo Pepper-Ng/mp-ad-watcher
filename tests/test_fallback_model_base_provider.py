@@ -81,6 +81,13 @@ async def test_fallback_base_provider_mode_hides_independent_connection_fields(
     assert 'id="fallback-temperature-field"' in page.text
     assert "applyFallbackProviderCapabilities" in page.text
     assert "fallbackReasoningField.hidden = !defaults.reasoningSupported" in page.text
+    assert "<label>Provider<select name='FALLBACK_MODEL_PROVIDER'" in page.text
+    assert "<label>API key<input type='password' name='FALLBACK_MODEL_API_KEY'" in page.text
+    assert "<label>Base URL<input name='FALLBACK_MODEL_BASE_URL'" in page.text
+    assert "<label>Model<input name='FALLBACK_MODEL_NAME'" in page.text
+    assert "Fallback provider" not in page.text
+    assert "Fallback API key" not in page.text
+    assert "Fallback base URL" not in page.text
     provider_settings_start = page.text.index('id="fallback-provider-settings"')
     provider_settings_end = page.text.index("</div>", provider_settings_start)
     provider_settings = page.text[provider_settings_start:provider_settings_end]
