@@ -36,8 +36,6 @@ def build_watcher(
 
 
 def build_profile_orchestrator(settings: Settings) -> ProfileOrchestrator:
-    """Build the profile-aware CLI runner while retaining ``build_watcher`` compatibility."""
-
     return ProfileOrchestrator(
         settings=settings,
         watcher_builder=lambda profile_settings, status_store: build_watcher(
