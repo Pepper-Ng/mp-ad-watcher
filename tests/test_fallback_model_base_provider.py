@@ -77,6 +77,10 @@ async def test_fallback_base_provider_mode_hides_independent_connection_fields(
     assert "id='fallback-use-base-provider'" in page.text
     assert 'id="fallback-provider-settings"' in page.text
     assert "applyFallbackProviderMode" in page.text
+    assert 'id="fallback-reasoning-field"' in page.text
+    assert 'id="fallback-temperature-field"' in page.text
+    assert "applyFallbackProviderCapabilities" in page.text
+    assert "fallbackReasoningField.hidden = !defaults.reasoningSupported" in page.text
     provider_settings_start = page.text.index('id="fallback-provider-settings"')
     provider_settings_end = page.text.index("</div>", provider_settings_start)
     provider_settings = page.text[provider_settings_start:provider_settings_end]

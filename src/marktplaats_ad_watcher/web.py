@@ -1481,16 +1481,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                             </div>
                             <div class="grid advanced-grid">
                                 {_input("FALLBACK_MODEL_NAME", values, label="Fallback model")}
-                                {_input(
+                                <div id="fallback-reasoning-field">{_input(
                                     "FALLBACK_MODEL_REASONING_EFFORT",
                                     values,
                                     label="Fallback reasoning effort",
-                                )}
-                                {_input(
+                                )}</div>
+                                <div id="fallback-temperature-field">{_input(
                                     "FALLBACK_MODEL_TEMPERATURE",
                                     values,
                                     label="Fallback temperature",
-                                )}
+                                )}</div>
                                 {_input(
                                     "FALLBACK_MODEL_MAX_TOKENS",
                                     values,
@@ -3079,6 +3079,11 @@ def _provider_defaults_script() -> str:
             const advancedSettings = document.querySelector("details.advanced");
             const fallbackUseBaseProvider = document.getElementById("fallback-use-base-provider");
             const fallbackProviderSettings = document.getElementById("fallback-provider-settings");
+            const fallbackProviderSelect = document.getElementById("fallback-provider");
+            const fallbackReasoningField = document.getElementById("fallback-reasoning-field");
+            const fallbackReasoningInput = document.querySelector('[name="FALLBACK_MODEL_REASONING_EFFORT"]');
+            const fallbackTemperatureField = document.getElementById("fallback-temperature-field");
+            const fallbackTemperatureInput = document.querySelector('[name="FALLBACK_MODEL_TEMPERATURE"]');
 
             function applyProvider(resetDefaults) {{
                 const defaults = providerDefaults[providerSelect.value];
@@ -3119,8 +3124,34 @@ def _provider_defaults_script() -> str:
                 }}
             }}
 
-            providerSelect.addEventListener("change", () => applyProvider(true));
+            function applyFallbackProviderCapabilities() {{
+                const fallbackProvider = fallbackUseBaseProvider.checked
+                    ? providerSelect.value
+                    : fallbackProviderSelect.value;
+                const defaults = providerDefaults[fallbackProvider];
+                if (!defaults) return;
+
+                fallbackReasoningField.hidden = !defaults.reasoningSupported;
+                fallbackReasoningInput.disabled = !defaults.reasoningSupported;
+                if (!defaults.reasoningSupported) fallbackReasoningInput.value = "";
+
+                const fallbackReasoningDisabled = ["", "none"].includes(
+                    fallbackReasoningInput.value
+                );
+                const showFallbackTemperature = defaults.temperatureSupported
+                    && (!defaults.temperatureRequiresNoReasoning || fallbackReasoningDisabled);
+                fallbackTemperatureField.hidden = !showFallbackTemperature;
+                fallbackTemperatureInput.disabled = !showFallbackTemperature;
+                if (!showFallbackTemperature) fallbackTemperatureInput.value = "0";
+            }}
+
+            providerSelect.addEventListener("change", () => {{
+                applyProvider(true);
+                applyFallbackProviderCapabilities();
+            }});
             reasoningSelect.addEventListener("change", () => applyProvider(false));
+            fallbackProviderSelect.addEventListener("change", applyFallbackProviderCapabilities);
+            fallbackReasoningInput.addEventListener("change", applyFallbackProviderCapabilities);
             function applyFallbackProviderMode() {{
                 const useBaseProvider = fallbackUseBaseProvider.checked;
                 fallbackProviderSettings.hidden = useBaseProvider;
@@ -3129,9 +3160,13 @@ def _provider_defaults_script() -> str:
                 }}
             }}
 
-            fallbackUseBaseProvider.addEventListener("change", applyFallbackProviderMode);
+            fallbackUseBaseProvider.addEventListener("change", () => {{
+                applyFallbackProviderMode();
+                applyFallbackProviderCapabilities();
+            }});
             applyProvider(false);
             applyFallbackProviderMode();
+            applyFallbackProviderCapabilities();
     </script>
     """
 
