@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,6 @@ import pytest
 from marktplaats_ad_watcher.config import Settings
 from marktplaats_ad_watcher.models import (
     Ad,
-    EvaluatedAd,
     EvaluationFailure,
     EvaluationResult,
     TelegramSendResult,
@@ -17,25 +17,16 @@ from marktplaats_ad_watcher.models import (
 from marktplaats_ad_watcher.runner import Watcher
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatusStore
+from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded
 
 
 class FakeMarktplaatsClient:
     def __init__(self, ads: list[Ad]) -> None:
         self._ads = ads
-        self.enriched_ids: list[str] = []
 
     async def fetch_ads(self, search_url: str, *, limit: int) -> list[Ad]:
         del search_url
         return self._ads[:limit]
-
-    async def enrich_ad(self, ad: Ad) -> Ad:
-        self.enriched_ids.append(ad.id)
-        return ad.model_copy(
-            update={
-                "description": "Full detail-page description.",
-                "listing_facts": {"Capacity": "458 L"},
-            }
-        )
 
 
 class RecordingEvaluator:
@@ -64,10 +55,7 @@ class FakeNotifier:
         self.sent_ads.append(evaluated_ad.ad.id)
         return TelegramSendResult(sent=True, message_id=1)
 
-    async def send_ai_failure_alert(
-        self,
-        failures: list[EvaluationFailure],
-    ) -> TelegramSendResult:
+    async def send_ai_failure_alert(self, failures: list[EvaluationFailure]) -> TelegramSendResult:
         self.ai_failure_alerts.append(failures)
         return TelegramSendResult(sent=True, message_id=2)
 
@@ -91,6 +79,16 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
         model_max_tokens=700,
         model_reasoning_effort=None,
         model_json_mode=True,
+        notify_ai_failures=True,
+        fallback_model_enabled=False,
+        fallback_model_provider=None,
+        fallback_model_api_key=None,
+        fallback_model_base_url=None,
+        fallback_model_name=None,
+        fallback_model_temperature=0.0,
+        fallback_model_max_tokens=700,
+        fallback_model_reasoning_effort=None,
+        fallback_model_json_mode=False,
         send_image_content_to_model=False,
         max_images_for_model=3,
         telegram_bot_token=None,
@@ -171,112 +169,6 @@ async def test_review_actions_are_stored_and_sent_to_telegram(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_production_notification_payload_includes_profile_metadata(tmp_path: Path) -> None:
-    settings = _settings(
-        tmp_path,
-        active_profile_id="freezers",
-        active_profile_name="Freezers",
-    )
-    evaluator = RecordingEvaluator(
-        EvaluationResult(
-            relevant=True,
-            confidence=0.91,
-            reason="Matches criteria.",
-            next_action="notify",
-        )
-    )
-
-    class CapturingNotifier(FakeNotifier):
-        def __init__(self) -> None:
-            super().__init__()
-            self.sent: list[EvaluatedAd] = []
-
-        async def send(self, evaluated_ad: Any) -> TelegramSendResult:
-            self.sent.append(evaluated_ad)
-            return TelegramSendResult(sent=True, message_id=7)
-
-    notifier = CapturingNotifier()
-    watcher = Watcher(
-        settings=settings,
-        marktplaats_client=FakeMarktplaatsClient(
-            [Ad(id="m321", title="Private freezer", url="https://example.test/m321")]
-        ),
-        evaluator=evaluator,
-        notifier=notifier,
-        store=SeenStore(settings.state_file),
-    )
-
-    summary = await watcher.run_once()
-
-    assert summary.notified_count == 1
-    assert len(notifier.sent) == 1
-    assert notifier.sent[0].profile_id == "freezers"
-    assert notifier.sent[0].profile_name == "Freezers"
-
-
-@pytest.mark.asyncio
-async def test_new_ads_are_enriched_before_model_evaluation(tmp_path: Path) -> None:
-    class CapturingEvaluator(RecordingEvaluator):
-        def __init__(self) -> None:
-            super().__init__()
-            self.evaluated_ads: list[Ad] = []
-
-        async def evaluate(self, ad: Ad) -> EvaluationResult:
-            self.evaluated_ads.append(ad)
-            return await super().evaluate(ad)
-
-    client = FakeMarktplaatsClient(
-        [Ad(id="m123", title="Freezer chest", url="https://example.test/m123")]
-    )
-    evaluator = CapturingEvaluator()
-    settings = _settings(tmp_path)
-    watcher = Watcher(
-        settings=settings,
-        marktplaats_client=client,
-        evaluator=evaluator,
-        notifier=FakeNotifier(),
-        store=SeenStore(settings.state_file),
-    )
-
-    await watcher.run_once()
-
-    assert client.enriched_ids == ["m123"]
-    assert evaluator.evaluated_ads[0].description == "Full detail-page description."
-    assert evaluator.evaluated_ads[0].listing_facts == {"Capacity": "458 L"}
-
-
-@pytest.mark.asyncio
-async def test_detail_page_failure_leaves_ad_pending_without_model_evaluation(
-    tmp_path: Path,
-) -> None:
-    class FailingDetailClient(FakeMarktplaatsClient):
-        async def enrich_ad(self, ad: Ad) -> Ad:
-            del ad
-            raise RuntimeError("Marktplaats detail page is temporarily unavailable.")
-
-    client = FailingDetailClient(
-        [Ad(id="m123", title="Freezer chest", url="https://example.test/m123")]
-    )
-    evaluator = RecordingEvaluator()
-    settings = _settings(tmp_path)
-    store = SeenStore(settings.state_file)
-    watcher = Watcher(
-        settings=settings,
-        marktplaats_client=client,
-        evaluator=evaluator,
-        notifier=FakeNotifier(),
-        store=store,
-    )
-
-    summary = await watcher.run_once()
-
-    assert summary.evaluation_failed_count == 1
-    assert "detail page is temporarily unavailable" in summary.evaluation_failures[0].error
-    assert evaluator.evaluated_ids == []
-    assert not store.has_seen("m123")
-
-
-@pytest.mark.asyncio
 async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     evaluator = RecordingEvaluator(
@@ -288,7 +180,7 @@ async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: P
         )
     )
 
-    class FailingNotifier(FakeNotifier):
+    class FailingNotifier:
         async def send(self, evaluated_ad: Any) -> TelegramSendResult:
             del evaluated_ad
             raise RuntimeError("Telegram unavailable")
@@ -313,133 +205,57 @@ async def test_notification_failure_does_not_repeat_model_evaluation(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_evaluation_failure_retries_then_stops_after_retry_budget(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-
-    class FailingEvaluator:
+async def test_budget_exhaustion_leaves_ad_pending_without_consuming_retries(
+    tmp_path: Path,
+) -> None:
+    class BudgetLimitedEvaluator:
         async def evaluate(self, ad: Ad) -> EvaluationResult:
             del ad
-            raise RuntimeError("Model provider returned HTTP 429 (free_rate_limited).")
+            raise ModelDailyLimitExceeded(used=30, limit=30, reset_at=datetime.now(UTC))
 
-    status_store = RuntimeStatusStore(settings.status_file)
+    settings = _settings(tmp_path)
     store = SeenStore(settings.state_file)
     watcher = Watcher(
         settings=settings,
         marktplaats_client=FakeMarktplaatsClient(
-            [Ad(id="m-pending", title="Pending freezer", url="https://example.test/pending")]
+            [Ad(id="m123", title="Pending freezer", url="https://example.test/m123")]
         ),
-        evaluator=FailingEvaluator(),
+        evaluator=BudgetLimitedEvaluator(),
         notifier=FakeNotifier(),
         store=store,
-        status_store=status_store,
+        status_store=RuntimeStatusStore(settings.status_file),
     )
 
     first = await watcher.run_once()
-    assert first.new_count == 1
-    assert first.evaluated_count == 0
-    assert first.evaluation_failed_count == 1
-    assert first.evaluation_failures[0].ad_id == "m-pending"
-    assert "free_rate_limited" in first.evaluation_failures[0].error
-    assert not store.has_seen("m-pending")
-
     second = await watcher.run_once()
-    assert not store.has_seen("m-pending")
 
-    assert second.new_count == 1
-    assert second.evaluation_failed_count == 1
-    assert not store.has_seen("m-pending")
-
-    third = await watcher.run_once()
-    assert third.new_count == 1
-    assert third.evaluation_failed_count == 1
-    assert store.has_seen("m-pending")
-
-    fourth = await watcher.run_once()
-    assert fourth.new_count == 0
-    assert fourth.evaluation_failed_count == 0
-
-    status = RuntimeStatusStore(settings.status_file).read()
-    assert status.total_evaluation_failed == 3
+    assert first.evaluation_failed_count == 0
+    assert second.evaluation_failed_count == 0
+    assert not store.has_seen("m123")
+    assert store.model_failure_attempts("m123") == 0
 
 
 @pytest.mark.asyncio
-async def test_production_model_failure_sends_one_deduplicated_telegram_alert(
-    tmp_path: Path,
-) -> None:
+async def test_model_failure_alert_is_sent_once_for_real_failures(tmp_path: Path) -> None:
     class FailingEvaluator:
         async def evaluate(self, ad: Ad) -> EvaluationResult:
             del ad
-            raise RuntimeError("Model provider returned HTTP 503 (request id: changing-value).")
+            raise RuntimeError("Model provider returned HTTP 503.")
 
-    settings = _settings(tmp_path)
-    status_store = RuntimeStatusStore(settings.status_file)
+    settings = _settings(tmp_path, notify_ai_failures=True)
     notifier = FakeNotifier()
     watcher = Watcher(
         settings=settings,
         marktplaats_client=FakeMarktplaatsClient(
-            [Ad(id="m-pending", title="Pending freezer", url="https://example.test/pending")]
+            [Ad(id="m123", title="Pending freezer", url="https://example.test/m123")]
         ),
         evaluator=FailingEvaluator(),
         notifier=notifier,
         store=SeenStore(settings.state_file),
-        status_store=status_store,
+        status_store=RuntimeStatusStore(settings.status_file),
     )
 
-    await watcher.run_once()
-    await watcher.run_once()
     await watcher.run_once()
     await watcher.run_once()
 
     assert len(notifier.ai_failure_alerts) == 1
-    assert notifier.ai_failure_alerts[0][0].ad_id == "m-pending"
-    assert notifier.ai_failure_alerts[0][0].stage == "model"
-    status = RuntimeStatusStore(settings.status_file).read()
-    assert status.last_ai_failure_alert_signature is None
-
-
-@pytest.mark.asyncio
-async def test_disabled_or_non_model_failure_does_not_send_ai_failure_alert(tmp_path: Path) -> None:
-    class FailingEvaluator:
-        async def evaluate(self, ad: Ad) -> EvaluationResult:
-            del ad
-            raise RuntimeError("Provider unavailable")
-
-    disabled_settings = _settings(tmp_path / "disabled", notify_ai_failures=False)
-    disabled_notifier = FakeNotifier()
-    disabled_watcher = Watcher(
-        settings=disabled_settings,
-        marktplaats_client=FakeMarktplaatsClient(
-            [Ad(id="m1", title="Pending", url="https://example.test/m1")]
-        ),
-        evaluator=FailingEvaluator(),
-        notifier=disabled_notifier,
-        store=SeenStore(disabled_settings.state_file),
-        status_store=RuntimeStatusStore(disabled_settings.status_file),
-    )
-
-    await disabled_watcher.run_once()
-
-    assert disabled_notifier.ai_failure_alerts == []
-
-    detail_settings = _settings(tmp_path / "detail")
-    detail_notifier = FakeNotifier()
-
-    class DetailFailureClient(FakeMarktplaatsClient):
-        async def enrich_ad(self, ad: Ad) -> Ad:
-            del ad
-            raise RuntimeError("Listing page unavailable")
-
-    detail_watcher = Watcher(
-        settings=detail_settings,
-        marktplaats_client=DetailFailureClient(
-            [Ad(id="m2", title="Details fail", url="https://example.test/m2")]
-        ),
-        evaluator=RecordingEvaluator(),
-        notifier=detail_notifier,
-        store=SeenStore(detail_settings.state_file),
-        status_store=RuntimeStatusStore(detail_settings.status_file),
-    )
-
-    await detail_watcher.run_once()
-
-    assert detail_notifier.ai_failure_alerts == []

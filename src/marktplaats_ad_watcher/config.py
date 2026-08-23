@@ -34,6 +34,16 @@ class Settings:
     model_max_tokens: int
     model_reasoning_effort: str | None
     model_json_mode: bool
+    notify_ai_failures: bool
+    fallback_model_enabled: bool
+    fallback_model_provider: str | None
+    fallback_model_api_key: str | None
+    fallback_model_base_url: str | None
+    fallback_model_name: str | None
+    fallback_model_temperature: float
+    fallback_model_max_tokens: int
+    fallback_model_reasoning_effort: str | None
+    fallback_model_json_mode: bool
     send_image_content_to_model: bool
     max_images_for_model: int
     telegram_bot_token: str | None
@@ -49,13 +59,15 @@ class Settings:
     persistent_data_root: Path | None = None
     active_profile_id: str | None = None
     active_profile_name: str | None = None
-    notify_ai_failures: bool = True
 
     def __post_init__(self) -> None:
-        normalized_search_url = normalize_marktplaats_search_url(self.marktplaats_search_url)
-        object.__setattr__(self, "marktplaats_search_url", normalized_search_url)
+        object.__setattr__(
+            self,
+            "marktplaats_search_url",
+            normalize_marktplaats_search_url(self.marktplaats_search_url),
+        )
         preset = provider_preset(self.model_provider)
-        _validate_url("MARKTPLAATS_SEARCH_URL", normalized_search_url)
+        _validate_url("MARKTPLAATS_SEARCH_URL", self.marktplaats_search_url)
         _validate_url("MODEL_BASE_URL", self.model_base_url)
         _validate_range("POLL_INTERVAL_SECONDS", self.poll_interval_seconds, minimum=1)
         _validate_range("MAX_ADS_PER_POLL", self.max_ads_per_poll, minimum=1, maximum=100)
@@ -63,6 +75,10 @@ class Settings:
         _validate_range("REVIEW_MIN_CONFIDENCE", self.review_min_confidence, minimum=0, maximum=1)
         _validate_range("MODEL_TEMPERATURE", self.model_temperature, minimum=0, maximum=2)
         _validate_range("MODEL_MAX_TOKENS", self.model_max_tokens, minimum=1)
+        _validate_range(
+            "FALLBACK_MODEL_TEMPERATURE", self.fallback_model_temperature, minimum=0, maximum=2
+        )
+        _validate_range("FALLBACK_MODEL_MAX_TOKENS", self.fallback_model_max_tokens, minimum=1)
         _validate_range("MAX_IMAGES_FOR_MODEL", self.max_images_for_model, minimum=1, maximum=10)
         _validate_range("REQUEST_TIMEOUT_SECONDS", self.request_timeout_seconds, minimum=0.1)
 
@@ -78,26 +94,44 @@ class Settings:
             raise ValueError(f"MODEL_REASONING_EFFORT must be one of: {supported}.")
         if not self.user_agent.strip():
             raise ValueError("USER_AGENT must not be empty.")
-
-    @property
-    def data_root(self) -> Path:
-        """Persistent root shared by profiles and the global model quota."""
-
-        return self.persistent_data_root or self.results_file.parent
+        if self.fallback_model_enabled:
+            if not self.fallback_model_provider:
+                raise ValueError("FALLBACK_MODEL_PROVIDER is required when fallback is enabled.")
+            fallback_preset = provider_preset(self.fallback_model_provider)
+            if not self.fallback_model_base_url:
+                raise ValueError("FALLBACK_MODEL_BASE_URL is required when fallback is enabled.")
+            _validate_url("FALLBACK_MODEL_BASE_URL", self.fallback_model_base_url)
+            if not self.fallback_model_name or not self.fallback_model_name.strip():
+                raise ValueError("FALLBACK_MODEL_NAME is required when fallback is enabled.")
+            if (
+                self.fallback_model_reasoning_effort is not None
+                and self.fallback_model_reasoning_effort not in REASONING_EFFORTS
+            ):
+                supported = ", ".join(sorted(REASONING_EFFORTS))
+                raise ValueError(
+                    f"FALLBACK_MODEL_REASONING_EFFORT must be one of: {supported}."
+                )
+            if (
+                fallback_preset.protocol == "openai_responses"
+                and self.fallback_model_max_tokens < 16
+            ):
+                raise ValueError(
+                    "FALLBACK_MODEL_MAX_TOKENS must be at least 16 for the OpenAI Responses API."
+                )
 
     @property
     def global_model_usage_file(self) -> Path:
         return self.data_root / "model_usage.json"
 
     @property
-    def pipeline_progress_file(self) -> Path:
-        """Persistent pipeline progress owned by this settings instance's search scope."""
+    def data_root(self) -> Path:
+        return self.persistent_data_root or self.results_file.parent
 
+    @property
+    def pipeline_progress_file(self) -> Path:
         return self.results_file.parent / "pipeline_progress.json"
 
     def legacy_search_file_paths(self) -> dict[str, Path]:
-        """Return legacy single-search persistence paths without including global usage."""
-
         return {
             "seen_ads.json": self.state_file,
             "evaluations.jsonl": self.results_file,
@@ -106,27 +140,32 @@ class Settings:
         }
 
     def for_profile(self, profile: SearchProfile) -> Settings:
-        """Resolve search-specific values and storage while retaining root-global settings."""
-
         from marktplaats_ad_watcher.profiles import profile_storage_paths
 
-        paths = profile_storage_paths(self.data_root, profile.id)
+        profile_id = profile.id
+        profile_name = profile.name
+        profile_search_url = profile.search_url
+        profile_use_case = profile.use_case
+        profile_poll_interval = profile.poll_interval_seconds
+        profile_bootstrap = profile.bootstrap_existing_ads
+
+        paths = profile_storage_paths(self.data_root, profile_id)
         return replace(
             self,
-            marktplaats_search_url=profile.search_url,
-            marktplaats_use_case=profile.use_case,
+            marktplaats_search_url=profile_search_url,
+            marktplaats_use_case=profile_use_case,
             poll_interval_seconds=(
-                profile.poll_interval_seconds
-                if profile.poll_interval_seconds is not None
+                profile_poll_interval
+                if profile_poll_interval is not None
                 else self.poll_interval_seconds
             ),
-            bootstrap_existing_ads=profile.bootstrap_existing_ads,
+            bootstrap_existing_ads=profile_bootstrap,
             state_file=paths.state_file,
             results_file=paths.results_file,
             status_file=paths.status_file,
             persistent_data_root=self.data_root,
-            active_profile_id=profile.id,
-            active_profile_name=profile.name,
+            active_profile_id=profile_id,
+            active_profile_name=profile_name,
         )
 
     @staticmethod
@@ -148,6 +187,13 @@ class Settings:
         model_name = _optional(values, "MODEL_NAME")
         model_temperature = _optional(values, "MODEL_TEMPERATURE")
         model_max_tokens = _optional(values, "MODEL_MAX_TOKENS")
+        fallback_model_enabled = _bool(values, "FALLBACK_MODEL_ENABLED", False)
+        fallback_model_provider = _optional(values, "FALLBACK_MODEL_PROVIDER")
+        fallback_model_api_key = _optional(values, "FALLBACK_MODEL_API_KEY")
+        fallback_model_base_url = _optional(values, "FALLBACK_MODEL_BASE_URL")
+        fallback_model_name = _optional(values, "FALLBACK_MODEL_NAME")
+        fallback_model_temperature = _optional(values, "FALLBACK_MODEL_TEMPERATURE")
+        fallback_model_max_tokens = _optional(values, "FALLBACK_MODEL_MAX_TOKENS")
         if use_legacy_deepseek:
             if "MODEL_API_KEY" not in values:
                 model_api_key = _optional(values, "DEEPSEEK_API_KEY")
@@ -162,6 +208,12 @@ class Settings:
 
         reasoning_value = values.get("MODEL_REASONING_EFFORT", "").strip().lower()
         model_reasoning_effort = reasoning_value or preset.reasoning_effort
+        fallback_reasoning_value = values.get("FALLBACK_MODEL_REASONING_EFFORT", "").strip().lower()
+
+        fallback_preset = None
+        if fallback_model_provider:
+            fallback_model_provider = fallback_model_provider.strip().lower()
+            fallback_preset = provider_preset(fallback_model_provider)
 
         return Settings(
             marktplaats_search_url=search_url,
@@ -181,6 +233,34 @@ class Settings:
             model_max_tokens=int(model_max_tokens) if model_max_tokens is not None else 700,
             model_reasoning_effort=model_reasoning_effort,
             model_json_mode=_bool(values, "MODEL_JSON_MODE", preset.json_mode),
+            notify_ai_failures=_bool(values, "NOTIFY_AI_FAILURES", True),
+            fallback_model_enabled=fallback_model_enabled,
+            fallback_model_provider=fallback_model_provider,
+            fallback_model_api_key=fallback_model_api_key,
+            fallback_model_base_url=(
+                fallback_model_base_url.rstrip("/")
+                if fallback_model_base_url is not None
+                else (fallback_preset.base_url.rstrip("/") if fallback_preset else None)
+            ),
+            fallback_model_name=(
+                fallback_model_name
+                or (fallback_preset.model if fallback_preset else None)
+            ),
+            fallback_model_temperature=(
+                float(fallback_model_temperature) if fallback_model_temperature is not None else 0.0
+            ),
+            fallback_model_max_tokens=(
+                int(fallback_model_max_tokens) if fallback_model_max_tokens is not None else 700
+            ),
+            fallback_model_reasoning_effort=(
+                fallback_reasoning_value
+                or (fallback_preset.reasoning_effort if fallback_preset else None)
+            ),
+            fallback_model_json_mode=_bool(
+                values,
+                "FALLBACK_MODEL_JSON_MODE",
+                fallback_preset.json_mode if fallback_preset is not None else False,
+            ),
             send_image_content_to_model=_bool(values, "SEND_IMAGE_CONTENT_TO_MODEL", False),
             max_images_for_model=_int(values, "MAX_IMAGES_FOR_MODEL", 3),
             telegram_bot_token=_optional(values, "TELEGRAM_BOT_TOKEN"),
@@ -198,7 +278,6 @@ class Settings:
             ),
             web_admin_token=_optional(values, "WEB_ADMIN_TOKEN"),
             dry_run=dry_run,
-            notify_ai_failures=_bool(values, "NOTIFY_AI_FAILURES", True),
         )
 
 

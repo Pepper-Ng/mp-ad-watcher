@@ -125,8 +125,8 @@ def _format_ai_failure_alert(
     lines = [
         f"<b>{escape(heading)}</b>",
         (
-            f"A production run could not evaluate {len(failures)} listing(s). "
-            "They remain pending and will retry automatically."
+            f"A production run could not finish AI evaluation for {len(failures)} search candidate(s). "
+            "These are not recommendations. Only real model-call failures are listed here."
         ),
     ]
     for failure in failures[:3]:

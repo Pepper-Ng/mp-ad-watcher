@@ -40,6 +40,16 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
         model_max_tokens=700,
         model_reasoning_effort=None,
         model_json_mode=True,
+        notify_ai_failures=True,
+        fallback_model_enabled=False,
+        fallback_model_provider=None,
+        fallback_model_api_key=None,
+        fallback_model_base_url=None,
+        fallback_model_name=None,
+        fallback_model_temperature=0.0,
+        fallback_model_max_tokens=700,
+        fallback_model_reasoning_effort=None,
+        fallback_model_json_mode=False,
         send_image_content_to_model=False,
         max_images_for_model=3,
         telegram_bot_token=None,
@@ -186,4 +196,4 @@ def test_ai_failure_alert_labels_and_escapes_listing_data() -> None:
     assert "[Freezers &amp; keezer · freezers] AI evaluation needs attention" in message
     assert "Freezer &lt;broken&gt;" in message
     assert "Model &lt;unavailable&gt;" in message
-    assert "remain pending and will retry automatically" in message
+    assert "These are not recommendations" in message

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -120,6 +121,33 @@ class SeenStore:
         }
         with path.open("a", encoding="utf-8") as output:
             output.write(evaluated_ad.model_dump_json(exclude=absent_profile_fields) + "\n")
+
+    def repair_budget_retry_exhaustion(self) -> tuple[int, Path | None]:
+        budget_phrase = "ModelDailyLimitExceeded"
+        repaired = 0
+        for ad_id, entry in list(self._data["seen_ads"].items()):
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("model_retry_exhausted"):
+                continue
+            if budget_phrase not in str(entry.get("model_last_error", "")):
+                continue
+            self._data["seen_ads"].pop(ad_id, None)
+            failures = self._data.get("model_failures")
+            if isinstance(failures, dict):
+                failures.pop(ad_id, None)
+            repaired += 1
+
+        if repaired == 0:
+            return 0, None
+
+        backup_path = self._path.with_suffix(
+            self._path.suffix + f".budget-repair-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.bak"
+        )
+        if self._path.exists():
+            shutil.copy2(self._path, backup_path)
+        self._save()
+        return repaired, backup_path
 
     def _load(self) -> dict[str, Any]:
         if not self._path.exists():

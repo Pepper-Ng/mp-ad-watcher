@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Protocol
 
 import httpx
@@ -18,21 +17,42 @@ from marktplaats_ad_watcher.evaluation import (
 )
 from marktplaats_ad_watcher.model_config import ModelProtocol, provider_preset
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
-from marktplaats_ad_watcher.usage import ModelUsageStore
-
-LOGGER = logging.getLogger(__name__)
-
-
-class ModelProviderError(RuntimeError):
-    def __init__(self, *, status_code: int, code: str | None, message: str) -> None:
-        self.status_code = status_code
-        self.code = code
-        code_text = f" ({code})" if code else ""
-        super().__init__(f"Model provider returned HTTP {status_code}{code_text}: {message}")
+from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded, ModelUsageStore
 
 
 class ProviderAdapter(Protocol):
     async def evaluate(self, ad: Ad) -> EvaluationResult: ...
+
+
+class ModelEvaluationError(RuntimeError):
+    attempt_consumed = True
+
+
+class ModelTransportError(ModelEvaluationError):
+    attempt_consumed = False
+
+
+class ModelProviderError(ModelEvaluationError):
+    pass
+
+
+class ModelOutputError(ModelEvaluationError):
+    pass
+
+
+class FallbackModelError(ModelEvaluationError):
+    def __init__(self, primary_error: Exception, fallback_error: Exception) -> None:
+        self.primary_error = primary_error
+        self.fallback_error = fallback_error
+        self.attempt_consumed = bool(
+            getattr(primary_error, "attempt_consumed", True)
+            or getattr(fallback_error, "attempt_consumed", True)
+        )
+        message = (
+            f"Primary model failed: {type(primary_error).__name__}: {primary_error}. "
+            f"Fallback model failed: {type(fallback_error).__name__}: {fallback_error}"
+        )
+        super().__init__(message)
 
 
 class HttpModelEvaluator(ABC):
@@ -54,46 +74,34 @@ class HttpModelEvaluator(ABC):
         try:
             async with httpx.AsyncClient(timeout=self._settings.request_timeout_seconds) as client:
                 response = await client.post(endpoint, headers=headers, json=payload)
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as error:
-                    code, message = _provider_error_details(response)
-                    raise ModelProviderError(
-                        status_code=response.status_code,
-                        code=code,
-                        message=message,
-                    ) from error
+        except httpx.RequestError as error:
+            reservation.release()
+            raise ModelTransportError(str(error)) from error
         except Exception:
             reservation.release()
             raise
 
-        response_payload: dict[str, Any] | None = None
         try:
-            parsed_payload = response.json()
-            if not isinstance(parsed_payload, dict):
-                raise ValueError("Model response was not a JSON object at the protocol level.")
-            response_payload = parsed_payload
-            response_text = self.response_text(response_payload)
-            result = parse_evaluation(response_text)
-        except Exception:
-            LOGGER.warning(
-                "%sModel response could not be parsed into a valid evaluation for ad %s; "
-                "releasing its model-budget reservation.",
-                _profile_log_context(self._settings),
-                ad.id,
-                extra={"diagnostic_detail": _diagnostic_response_payload(response_payload)},
-            )
-            reservation.release()
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            reservation.commit()
+            raise ModelProviderError(str(error)) from error
+
+        try:
+            response_payload = response.json()
+            if not isinstance(response_payload, dict):
+                raise ModelOutputError(
+                    "Model response was not a JSON object at the protocol level."
+                )
+            result = parse_evaluation(self.response_text(response_payload))
+        except ModelOutputError:
+            reservation.commit()
             raise
+        except Exception as error:
+            reservation.commit()
+            raise ModelOutputError(str(error)) from error
 
         reservation.commit()
-        profile_context = _profile_log_context(self._settings)
-        LOGGER.info(
-            "%sModel response received for ad %s.",
-            profile_context,
-            ad.id,
-            extra={"diagnostic_detail": response_text[:8000]},
-        )
         return result
 
     @abstractmethod
@@ -116,7 +124,7 @@ class OpenAICompatibleEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         user_content: str | list[dict[str, Any]]
-        if prompt.image_urls:
+        if self._settings.send_image_content_to_model and prompt.image_urls:
             user_content = [{"type": "text", "text": prompt.user}]
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 user_content.append({"type": "image_url", "image_url": {"url": image_url}})
@@ -148,46 +156,16 @@ class OpenAICompatibleEvaluator(HttpModelEvaluator):
 
     def response_text(self, response_payload: dict[str, Any]) -> str:
         try:
-            choice = response_payload["choices"][0]
-            message = choice["message"]
+            content = response_payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
             raise ValueError(
                 f"Unexpected OpenAI-compatible response shape: {response_payload}"
             ) from error
-
-        content = message.get("content") if isinstance(message, dict) else None
-        text = _message_text(content)
-        if text:
-            return text
-
-        if isinstance(message, dict):
-            for field in ("text", "output_text"):
-                text = _message_text(message.get(field))
-                if text:
-                    return text
-
-            for field in ("reasoning_content", "reasoning"):
-                reasoning = message.get(field)
-                if isinstance(reasoning, str) and _contains_json_object(reasoning):
-                    return reasoning
-
-        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
-        reasoning_present = bool(
-            isinstance(message, dict)
-            and any(
-                isinstance(message.get(field), str) and message[field].strip()
-                for field in ("reasoning_content", "reasoning")
+        if not isinstance(content, str):
+            raise ValueError(
+                f"Unexpected OpenAI-compatible assistant content type: {type(content).__name__}"
             )
-        )
-        hint = (
-            " The response contains reasoning text but no final answer."
-            if reasoning_present
-            else ""
-        )
-        raise ValueError(
-            "Model returned no final assistant content"
-            f" (finish_reason={finish_reason!r}).{hint}"
-        )
+        return content
 
 
 class OpenAIResponsesEvaluator(HttpModelEvaluator):
@@ -195,7 +173,7 @@ class OpenAIResponsesEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         input_content: str | list[dict[str, Any]]
-        if prompt.image_urls:
+        if self._settings.send_image_content_to_model and prompt.image_urls:
             input_content = [{"type": "input_text", "text": prompt.user}]
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 input_content.append(
@@ -272,7 +250,7 @@ class AnthropicMessagesEvaluator(HttpModelEvaluator):
 
     def request(self, prompt: EvaluationPrompt) -> tuple[str, dict[str, str], dict[str, Any]]:
         user_content: str | list[dict[str, Any]]
-        if prompt.image_urls:
+        if self._settings.send_image_content_to_model and prompt.image_urls:
             user_content = []
             for image_url in prompt.image_urls[: self._settings.max_images_for_model]:
                 user_content.append(
@@ -336,66 +314,53 @@ def build_model_evaluator(settings: Settings) -> Evaluator:
         adapter = ADAPTERS[preset.protocol]
     except KeyError as error:
         raise ValueError(f"No evaluator adapter is registered for {preset.protocol}.") from error
-    return adapter(settings)
+    primary = adapter(settings)
+    if not settings.fallback_model_enabled:
+        return primary
+
+    fallback_provider = settings.fallback_model_provider
+    if not fallback_provider:
+        raise ValueError("FALLBACK_MODEL_PROVIDER is required when fallback is enabled.")
+    fallback_settings = replace(
+        settings,
+        model_provider=fallback_provider,
+        model_api_key=settings.fallback_model_api_key,
+        model_base_url=settings.fallback_model_base_url or "",
+        model_name=settings.fallback_model_name or "",
+        model_temperature=settings.fallback_model_temperature,
+        model_max_tokens=settings.fallback_model_max_tokens,
+        model_reasoning_effort=settings.fallback_model_reasoning_effort,
+        model_json_mode=settings.fallback_model_json_mode,
+        fallback_model_enabled=False,
+    )
+    fallback_preset = provider_preset(fallback_provider)
+    try:
+        fallback_adapter = ADAPTERS[fallback_preset.protocol]
+    except KeyError as error:
+        raise ValueError(
+            f"No evaluator adapter is registered for fallback protocol {fallback_preset.protocol}."
+        ) from error
+    return FallbackEvaluator(primary=primary, fallback=fallback_adapter(fallback_settings))
+
+
+class FallbackEvaluator:
+    def __init__(self, *, primary: Evaluator, fallback: Evaluator) -> None:
+        self._primary = primary
+        self._fallback = fallback
+
+    async def evaluate(self, ad: Ad) -> EvaluationResult:
+        try:
+            return await self._primary.evaluate(ad)
+        except ModelDailyLimitExceeded:
+            raise
+        except Exception as primary_error:
+            try:
+                return await self._fallback.evaluate(ad)
+            except ModelDailyLimitExceeded:
+                raise
+            except Exception as fallback_error:
+                raise FallbackModelError(primary_error, fallback_error) from fallback_error
 
 
 def _endpoint(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
-
-
-def _provider_error_details(response: httpx.Response) -> tuple[str | None, str]:
-    code: str | None = None
-    message = response.reason_phrase or "Request failed."
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            raw_code = error.get("code")
-            raw_message = error.get("message")
-            if isinstance(raw_code, str) and raw_code.strip():
-                code = raw_code.strip()
-            if isinstance(raw_message, str) and raw_message.strip():
-                message = raw_message.strip()
-    return code, message[:500]
-
-
-def _message_text(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value
-    if not isinstance(value, list):
-        return None
-
-    parts = [
-        block["text"]
-        for block in value
-        if isinstance(block, dict)
-        and isinstance(block.get("text"), str)
-        and block["text"].strip()
-    ]
-    return "".join(parts) if parts else None
-
-
-def _contains_json_object(value: str) -> bool:
-    return "{" in value and "}" in value
-
-
-def _diagnostic_response_payload(payload: dict[str, Any] | None) -> str:
-    if payload is None:
-        return "No JSON response payload was available."
-    try:
-        return json.dumps(payload, ensure_ascii=False, default=str)[:8000]
-    except (TypeError, ValueError):
-        return repr(payload)[:8000]
-
-
-def _profile_log_context(settings: Settings) -> str:
-    if settings.active_profile_name and settings.active_profile_id:
-        return f"[{settings.active_profile_name} · {settings.active_profile_id}] "
-    if settings.active_profile_name:
-        return f"[{settings.active_profile_name}] "
-    if settings.active_profile_id:
-        return f"[{settings.active_profile_id}] "
-    return ""

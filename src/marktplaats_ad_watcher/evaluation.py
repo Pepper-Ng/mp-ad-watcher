@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import json
-import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from json_repair import loads as repair_json_loads
-
 from marktplaats_ad_watcher.models import Ad, EvaluationResult
-
-LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You evaluate Marktplaats classified ads for one private buyer. "
@@ -20,8 +16,8 @@ SYSTEM_PROMPT = (
 )
 
 IMAGE_AWARE_SYSTEM_PROMPT = (
-    f"{SYSTEM_PROMPT} Listing images are attached separately. Inspect their visible "
-    "contents as additional evidence, but do not invent details that cannot be seen clearly."
+    f"{SYSTEM_PROMPT} Listing images are attached separately. Inspect them as additional "
+    "evidence, but do not invent details that are not clearly visible."
 )
 
 EVALUATION_JSON_SCHEMA: dict[str, Any] = {
@@ -132,8 +128,12 @@ def parse_json_object(content: str) -> dict[str, Any]:
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
-            parsed = repair_json_loads(candidate)
-            LOGGER.warning("Repaired malformed JSON returned by the model before validation.")
+            repaired = re.sub(
+                r'(?P<prefix>[{,]\s*)(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*:',
+                lambda match: f'{match.group("prefix")}"{match.group("key")}":',
+                candidate,
+            )
+            parsed = json.loads(repaired)
 
     if not isinstance(parsed, dict):
         raise ValueError("Model response was not a JSON object.")

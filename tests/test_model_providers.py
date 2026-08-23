@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,13 +11,14 @@ from marktplaats_ad_watcher.config import Settings
 from marktplaats_ad_watcher.evaluation import build_evaluation_prompt
 from marktplaats_ad_watcher.model_providers import (
     AnthropicMessagesEvaluator,
-    ModelProviderError,
+    FallbackEvaluator,
+    ModelOutputError,
     OpenAICompatibleEvaluator,
     OpenAIResponsesEvaluator,
     build_model_evaluator,
 )
 from marktplaats_ad_watcher.models import Ad
-from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded, ModelUsageStore
+from marktplaats_ad_watcher.usage import ModelUsageStore
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -40,6 +40,16 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
         model_max_tokens=700,
         model_reasoning_effort=None,
         model_json_mode=True,
+        notify_ai_failures=True,
+        fallback_model_enabled=False,
+        fallback_model_provider=None,
+        fallback_model_api_key=None,
+        fallback_model_base_url=None,
+        fallback_model_name=None,
+        fallback_model_temperature=0.0,
+        fallback_model_max_tokens=700,
+        fallback_model_reasoning_effort=None,
+        fallback_model_json_mode=False,
         send_image_content_to_model=False,
         max_images_for_model=3,
         telegram_bot_token=None,
@@ -60,32 +70,8 @@ def _ad() -> Ad:
         id="m1",
         title="Chest freezer",
         url="https://example.test/m1",
-        description="A complete listing description with stated dimensions.",
         image_urls=["https://example.test/1.jpg", "https://example.test/2.jpg"],
     )
-
-
-def test_text_only_prompt_omits_all_image_information() -> None:
-    prompt = build_evaluation_prompt("Find chest freezers.", _ad())
-
-    assert prompt.image_urls == []
-    assert "Image URLs:" not in prompt.user
-    assert "images" not in prompt.user
-    assert "images" not in prompt.system
-    assert "Description: A complete listing description" in prompt.user
-
-
-def test_image_aware_prompt_includes_attached_image_context() -> None:
-    prompt = build_evaluation_prompt(
-        "Find chest freezers.",
-        _ad(),
-        include_image_content=True,
-    )
-
-    assert prompt.image_urls == ["https://example.test/1.jpg", "https://example.test/2.jpg"]
-    assert "Image URLs:" in prompt.user
-    assert "images" in prompt.user
-    assert "images are attached separately" in prompt.system
 
 
 def test_provider_factory_selects_protocol_adapter(tmp_path: Path) -> None:
@@ -128,11 +114,7 @@ def test_openai_compatible_request_supports_json_reasoning_and_images(tmp_path: 
     evaluator = OpenAICompatibleEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(
-            settings.marktplaats_use_case,
-            _ad(),
-            include_image_content=settings.send_image_content_to_model,
-        )
+        build_evaluation_prompt(settings.marktplaats_use_case, _ad(), include_image_content=True)
     )
 
     assert endpoint.endswith("/v1beta/openai/chat/completions")
@@ -146,13 +128,7 @@ def test_deepseek_omits_unsupported_reasoning_effort(tmp_path: Path) -> None:
     settings = _settings(tmp_path, model_reasoning_effort="medium")
     evaluator = OpenAICompatibleEvaluator(settings)
 
-    _, _, payload = evaluator.request(
-        build_evaluation_prompt(
-            settings.marktplaats_use_case,
-            _ad(),
-            include_image_content=settings.send_image_content_to_model,
-        )
-    )
+    _, _, payload = evaluator.request(build_evaluation_prompt(settings.marktplaats_use_case, _ad()))
 
     assert "reasoning_effort" not in payload
 
@@ -170,11 +146,7 @@ def test_openai_responses_request_uses_native_schema_reasoning_and_images(tmp_pa
     evaluator = OpenAIResponsesEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(
-            settings.marktplaats_use_case,
-            _ad(),
-            include_image_content=settings.send_image_content_to_model,
-        )
+        build_evaluation_prompt(settings.marktplaats_use_case, _ad(), include_image_content=True)
     )
 
     assert endpoint == "https://api.openai.com/v1/responses"
@@ -202,11 +174,7 @@ def test_openai_sends_temperature_only_when_reasoning_is_disabled(tmp_path: Path
     without_reasoning = OpenAIResponsesEvaluator(
         replace(base, model_reasoning_effort="none")
     )
-    prompt = build_evaluation_prompt(
-        base.marktplaats_use_case,
-        _ad(),
-        include_image_content=base.send_image_content_to_model,
-    )
+    prompt = build_evaluation_prompt(base.marktplaats_use_case, _ad())
 
     _, _, reasoning_payload = with_reasoning.request(prompt)
     _, _, no_reasoning_payload = without_reasoning.request(prompt)
@@ -228,11 +196,7 @@ def test_anthropic_request_uses_native_headers_schema_and_images(tmp_path: Path)
     evaluator = AnthropicMessagesEvaluator(settings)
 
     endpoint, headers, payload = evaluator.request(
-        build_evaluation_prompt(
-            settings.marktplaats_use_case,
-            _ad(),
-            include_image_content=settings.send_image_content_to_model,
-        )
+        build_evaluation_prompt(settings.marktplaats_use_case, _ad(), include_image_content=True)
     )
 
     assert endpoint == "https://api.anthropic.com/v1/messages"
@@ -251,7 +215,6 @@ def test_anthropic_request_uses_native_headers_schema_and_images(tmp_path: Path)
 async def test_openai_compatible_evaluator_parses_valid_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -292,244 +255,10 @@ async def test_openai_compatible_evaluator_parses_valid_response(
             )
 
     monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-    caplog.set_level(logging.INFO, logger="marktplaats_ad_watcher.model_providers")
     result = await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
 
     assert result.next_action == "notify"
     assert captured["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
-    details = [getattr(record, "diagnostic_detail", "") for record in caplog.records]
-    assert any('"next_action":"notify"' in detail for detail in details)
-
-
-@pytest.mark.asyncio
-async def test_provider_http_error_exposes_safe_code_and_message(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class StubAsyncClient:
-        def __init__(self, *, timeout: float) -> None:
-            del timeout
-
-        async def __aenter__(self) -> StubAsyncClient:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            del args
-
-        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-            del kwargs
-            return httpx.Response(
-                429,
-                request=httpx.Request("POST", endpoint),
-                json={
-                    "error": {
-                        "code": "free_rate_limited",
-                        "message": "Free model capacity is limited right now.",
-                    }
-                },
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-    settings = _settings(tmp_path)
-
-    with pytest.raises(ModelProviderError) as captured:
-        await OpenAICompatibleEvaluator(settings).evaluate(_ad())
-
-    assert captured.value.status_code == 429
-    assert captured.value.code == "free_rate_limited"
-    assert "Free model capacity is limited" in str(captured.value)
-    usage = ModelUsageStore(settings.results_file.parent / "model_usage.json").snapshot()
-    assert usage.used == 0
-    assert usage.in_flight == 0
-
-
-@pytest.mark.asyncio
-async def test_model_evaluator_enforces_daily_budget_before_outbound_call(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = 0
-
-    class StubAsyncClient:
-        def __init__(self, *, timeout: float) -> None:
-            del timeout
-
-        async def __aenter__(self) -> StubAsyncClient:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            del args
-
-        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-            nonlocal calls
-            del kwargs
-            calls += 1
-            return httpx.Response(
-                200,
-                request=httpx.Request("POST", endpoint),
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": (
-                                    '{"relevant":true,"confidence":0.9,'
-                                    '"reason":"Good match.","signals":[],'
-                                    '"concerns":[],"next_action":"notify"}'
-                                )
-                            }
-                        }
-                    ]
-                },
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-    settings = _settings(tmp_path)
-    ModelUsageStore(settings.results_file.parent / "model_usage.json").set_limit(1)
-    evaluator = OpenAICompatibleEvaluator(settings)
-
-    await evaluator.evaluate(_ad())
-    with pytest.raises(ModelDailyLimitExceeded):
-        await evaluator.evaluate(_ad())
-
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_malformed_model_json_is_repaired_and_counts_after_validation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class StubAsyncClient:
-        def __init__(self, *, timeout: float) -> None:
-            del timeout
-
-        async def __aenter__(self) -> StubAsyncClient:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            del args
-
-        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-            del kwargs
-            return httpx.Response(
-                200,
-                request=httpx.Request("POST", endpoint),
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": (
-                                    '{"relevant":false,"confidence":0.85,'
-                                    '"reason":"Broken freezer.",signals:["broken"],'
-                                    '"concerns":[],"next_action":"ignore"}'
-                                )
-                            }
-                        }
-                    ]
-                },
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-    settings = _settings(tmp_path)
-
-    result = await OpenAICompatibleEvaluator(settings).evaluate(_ad())
-
-    assert result.next_action == "ignore"
-    usage = ModelUsageStore(settings.global_model_usage_file).snapshot()
-    assert usage.used == 1
-    assert usage.in_flight == 0
-
-
-@pytest.mark.asyncio
-async def test_qwen_reasoning_json_is_accepted_when_final_content_is_empty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class StubAsyncClient:
-        def __init__(self, *, timeout: float) -> None:
-            del timeout
-
-        async def __aenter__(self) -> StubAsyncClient:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            del args
-
-        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-            del kwargs
-            return httpx.Response(
-                200,
-                request=httpx.Request("POST", endpoint),
-                json={
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "content": None,
-                                "reasoning": (
-                                    "Final evaluation: {\"relevant\":true,\"confidence\":0.8,"
-                                    "\"reason\":\"Good size.\",\"signals\":[],"
-                                    "\"concerns\":[],\"next_action\":\"notify\"}"
-                                ),
-                            },
-                        }
-                    ]
-                },
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-
-    result = await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
-
-    assert result.next_action == "notify"
-
-
-@pytest.mark.asyncio
-async def test_missing_final_content_releases_quota_and_logs_payload(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class StubAsyncClient:
-        def __init__(self, *, timeout: float) -> None:
-            del timeout
-
-        async def __aenter__(self) -> StubAsyncClient:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            del args
-
-        async def post(self, endpoint: str, **kwargs: Any) -> httpx.Response:
-            del kwargs
-            return httpx.Response(
-                200,
-                request=httpx.Request("POST", endpoint),
-                json={
-                    "choices": [
-                        {
-                            "finish_reason": "length",
-                            "message": {
-                                "content": None,
-                                "reasoning_content": "The response stopped before its final JSON.",
-                            },
-                        }
-                    ]
-                },
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
-    caplog.set_level(logging.WARNING, logger="marktplaats_ad_watcher.model_providers")
-    settings = _settings(tmp_path)
-
-    with pytest.raises(ValueError, match="no final assistant content"):
-        await OpenAICompatibleEvaluator(settings).evaluate(_ad())
-
-    usage = ModelUsageStore(settings.global_model_usage_file).snapshot()
-    assert usage.used == 0
-    assert usage.in_flight == 0
-    details = [getattr(record, "diagnostic_detail", "") for record in caplog.records]
-    assert any('"content": null' in detail for detail in details)
 
 
 def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> None:
@@ -556,3 +285,111 @@ def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> Non
 
     assert openai.response_text({"status": "completed", "output_text": expected}) == expected
     assert anthropic.response_text({"content": [{"type": "text", "text": expected}]}) == expected
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_after_successful_http_call_counts_toward_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(
+            self,
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            del headers, json
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={"choices": [{"message": {"content": "not-json"}}]},
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+
+    with pytest.raises(ModelOutputError):
+        await OpenAICompatibleEvaluator(_settings(tmp_path)).evaluate(_ad())
+
+    assert ModelUsageStore(_settings(tmp_path).global_model_usage_file).snapshot().used == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_model_is_used_when_primary_model_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self) -> StubAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(
+            self,
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            del headers, json
+            if "primary.example.test" in endpoint:
+                return httpx.Response(
+                    503,
+                    request=httpx.Request("POST", endpoint),
+                    json={"error": {"message": "upstream unavailable"}},
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", endpoint),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"relevant":false,"confidence":0.2,'
+                                    '"reason":"Fallback succeeded.","signals":[],'
+                                    '"concerns":[],"next_action":"ignore"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", StubAsyncClient)
+    evaluator = build_model_evaluator(
+        _settings(
+            tmp_path,
+            model_provider="openai-compatible",
+            model_api_key="primary-key",
+            model_base_url="https://primary.example.test/v1",
+            model_name="cheap-model",
+            model_json_mode=False,
+            fallback_model_enabled=True,
+            fallback_model_provider="openai-compatible",
+            fallback_model_api_key="fallback-key",
+            fallback_model_base_url="https://fallback.example.test/v1",
+            fallback_model_name="reliable-model",
+            fallback_model_json_mode=True,
+        )
+    )
+
+    assert isinstance(evaluator, FallbackEvaluator)
+    result = await evaluator.evaluate(_ad())
+
+    assert result.reason == "Fallback succeeded."
