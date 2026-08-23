@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
+
+from pydantic import BaseModel, Field
 
 from marktplaats_ad_watcher.config import Settings
 from marktplaats_ad_watcher.evaluation import Evaluator
@@ -16,6 +19,7 @@ from marktplaats_ad_watcher.models import (
     TelegramSendResult,
     WatcherRunSummary,
 )
+from marktplaats_ad_watcher.profiles import ProfileRegistry, SearchProfile, ensure_profile_registry
 from marktplaats_ad_watcher.state import SeenStore
 from marktplaats_ad_watcher.status import RuntimeStatusStore
 from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded
@@ -30,6 +34,118 @@ class AdFetcher(Protocol):
 
 class Notifier(Protocol):
     async def send(self, evaluated_ad: EvaluatedAd, /) -> TelegramSendResult: ...
+
+
+class RunnableWatcher(Protocol):
+    async def run_once(self) -> WatcherRunSummary: ...
+
+
+class ProfileRunResult(BaseModel):
+    profile_id: str
+    profile_name: str
+    summary: WatcherRunSummary | None = None
+    error: str | None = None
+    skipped_reason: str | None = None
+    next_run_at: datetime | None = None
+
+
+class ProfileExecutionSummary(BaseModel):
+    profiles: list[ProfileRunResult] = Field(default_factory=list)
+
+
+WatcherBuilder = Callable[[Settings, RuntimeStatusStore], RunnableWatcher]
+
+
+class ProfileOrchestrator:
+    def __init__(self, *, settings: Settings, watcher_builder: WatcherBuilder) -> None:
+        self._settings = settings
+        self._watcher_builder = watcher_builder
+
+    async def run_profile(
+        self,
+        profile_id: str | None = None,
+        *,
+        due_only: bool = False,
+    ) -> ProfileExecutionSummary:
+        registry = self._activate_registry()
+        profile = registry.default_profile if profile_id is None else registry.profile(profile_id)
+        return ProfileExecutionSummary(
+            profiles=[await self._run_profile(profile, due_only=due_only)]
+        )
+
+    async def run_all_enabled(self, *, due_only: bool = False) -> ProfileExecutionSummary:
+        registry = self._activate_registry()
+        outcomes: list[ProfileRunResult] = []
+        for profile in sorted(registry.profiles, key=lambda item: item.sort_order):
+            outcomes.append(await self._run_profile(profile, due_only=due_only))
+        return ProfileExecutionSummary(profiles=outcomes)
+
+    async def run_loop(
+        self,
+        *,
+        profile_id: str | None = None,
+        all_profiles: bool = False,
+    ) -> None:
+        while True:
+            execution = (
+                await self.run_all_enabled(due_only=True)
+                if all_profiles
+                else await self.run_profile(profile_id, due_only=True)
+            )
+            LOGGER.info("Profile execution summary: %s", execution.model_dump())
+            await asyncio.sleep(self._seconds_until_next_run(execution))
+
+    def _activate_registry(self) -> ProfileRegistry:
+        return ensure_profile_registry(self._settings).registry
+
+    async def _run_profile(self, profile: SearchProfile, *, due_only: bool) -> ProfileRunResult:
+        if not profile.enabled:
+            return ProfileRunResult(
+                profile_id=profile.id,
+                profile_name=profile.name,
+                skipped_reason="disabled",
+            )
+
+        profile_settings = self._settings.for_profile(profile)
+        status_store = RuntimeStatusStore(profile_settings.status_file)
+        if due_only and not _is_due(status_store.read().next_run_at):
+            return ProfileRunResult(
+                profile_id=profile.id,
+                profile_name=profile.name,
+                skipped_reason="not_due",
+                next_run_at=status_store.read().next_run_at,
+            )
+
+        next_run_at = datetime.now(UTC) + timedelta(seconds=profile_settings.poll_interval_seconds)
+        watcher: RunnableWatcher | None = None
+        try:
+            watcher = self._watcher_builder(profile_settings, status_store)
+            summary = await watcher.run_once()
+        except Exception as error:
+            LOGGER.exception("Profile %s (%s) failed.", profile.name, profile.id)
+            if watcher is None:
+                status_store.mark_failed(error)
+            return ProfileRunResult(
+                profile_id=profile.id,
+                profile_name=profile.name,
+                error=_profile_error_message(error),
+                next_run_at=_set_next_run_at(status_store, next_run_at),
+            )
+
+        return ProfileRunResult(
+            profile_id=profile.id,
+            profile_name=profile.name,
+            summary=summary,
+            next_run_at=_set_next_run_at(status_store, next_run_at),
+        )
+
+    def _seconds_until_next_run(self, execution: ProfileExecutionSummary) -> float:
+        scheduled = [
+            result.next_run_at for result in execution.profiles if result.next_run_at is not None
+        ]
+        if not scheduled:
+            return float(self._settings.poll_interval_seconds)
+        return max(0.0, (min(scheduled) - datetime.now(UTC)).total_seconds())
 
 
 class Watcher:
@@ -149,6 +265,12 @@ class Watcher:
                 continue
 
             evaluated_ad = EvaluatedAd(ad=ad, result=result)
+            evaluated_ad = evaluated_ad.model_copy(
+                update={
+                    "profile_id": self._settings.active_profile_id,
+                    "profile_name": self._settings.active_profile_name,
+                }
+            )
             evaluated_count += 1
             if result.next_action == "ignore":
                 ignored_count += 1
@@ -286,3 +408,17 @@ def _failure_consumes_retry(error: Exception) -> bool:
     if isinstance(error, ModelEvaluationError):
         return bool(getattr(error, "attempt_consumed", True))
     return True
+
+
+def _is_due(next_run_at: datetime | None) -> bool:
+    return next_run_at is None or next_run_at <= datetime.now(UTC)
+
+
+def _set_next_run_at(status_store: RuntimeStatusStore, value: datetime) -> datetime:
+    status_store.set_next_run_at(value)
+    return value
+
+
+def _profile_error_message(error: Exception) -> str:
+    message = str(error).strip() or "No error details were supplied."
+    return f"{type(error).__name__}: {message}"[:600]
