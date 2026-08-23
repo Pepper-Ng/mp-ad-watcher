@@ -77,6 +77,13 @@ async def test_fallback_base_provider_mode_hides_independent_connection_fields(
     assert "id='fallback-use-base-provider'" in page.text
     assert 'id="fallback-provider-settings"' in page.text
     assert "applyFallbackProviderMode" in page.text
+    provider_settings_start = page.text.index('id="fallback-provider-settings"')
+    provider_settings_end = page.text.index("</div>", provider_settings_start)
+    provider_settings = page.text[provider_settings_start:provider_settings_end]
+    assert "FALLBACK_MODEL_NAME" not in provider_settings
+    assert "FALLBACK_MODEL_REASONING_EFFORT" not in provider_settings
+    assert "FALLBACK_MODEL_TEMPERATURE" not in provider_settings
+    assert "FALLBACK_MODEL_MAX_TOKENS" not in provider_settings
     assert response.status_code == 303
     assert saved["FALLBACK_MODEL_USE_BASE_PROVIDER"] == "true"
     assert settings.fallback_model_provider == "openai-compatible"

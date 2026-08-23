@@ -1478,6 +1478,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                                     values,
                                     label="Fallback base URL",
                                 )}
+                            </div>
+                            <div class="grid advanced-grid">
                                 {_input("FALLBACK_MODEL_NAME", values, label="Fallback model")}
                                 {_input(
                                     "FALLBACK_MODEL_REASONING_EFFORT",
