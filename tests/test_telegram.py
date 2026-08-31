@@ -196,4 +196,5 @@ def test_ai_failure_alert_labels_and_escapes_listing_data() -> None:
     assert "[Freezers &amp; keezer · freezers] AI evaluation needs attention" in message
     assert "Freezer &lt;broken&gt;" in message
     assert "Model &lt;unavailable&gt;" in message
-    assert "These are not recommendations" in message
+    assert "after all automatic retries" in message
+    assert "will not be retried automatically" in message

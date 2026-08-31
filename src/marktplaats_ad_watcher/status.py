@@ -132,7 +132,9 @@ class RuntimeStatusStore:
 
 def _model_failure_signature(summary: WatcherRunSummary) -> str | None:
     model_failures = [
-        failure for failure in summary.evaluation_failures if failure.stage == "model"
+        failure
+        for failure in summary.evaluation_failures
+        if failure.stage == "model" and failure.retry_exhausted
     ]
     if not model_failures:
         return None

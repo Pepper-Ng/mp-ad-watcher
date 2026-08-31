@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
+from marktplaats_ad_watcher.model_providers import ModelTransportError
 from marktplaats_ad_watcher.models import (
     Ad,
     EvaluationFailure,
@@ -236,7 +237,9 @@ async def test_budget_exhaustion_leaves_ad_pending_without_consuming_retries(
 
 
 @pytest.mark.asyncio
-async def test_model_failure_alert_is_sent_once_for_real_failures(tmp_path: Path) -> None:
+async def test_model_failure_alert_is_sent_only_after_retries_are_exhausted(
+    tmp_path: Path,
+) -> None:
     class FailingEvaluator:
         async def evaluate(self, ad: Ad) -> EvaluationResult:
             del ad
@@ -255,7 +258,43 @@ async def test_model_failure_alert_is_sent_once_for_real_failures(tmp_path: Path
         status_store=RuntimeStatusStore(settings.status_file),
     )
 
-    await watcher.run_once()
-    await watcher.run_once()
+    first = await watcher.run_once()
+    second = await watcher.run_once()
+
+    assert first.evaluation_failures[0].retry_exhausted is False
+    assert second.evaluation_failures[0].retry_exhausted is False
+    assert notifier.ai_failure_alerts == []
+
+    third = await watcher.run_once()
 
     assert len(notifier.ai_failure_alerts) == 1
+    assert third.evaluation_failures[0].retry_exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_transient_transport_failures_do_not_send_ai_failure_alerts(
+    tmp_path: Path,
+) -> None:
+    class TransportFailingEvaluator:
+        async def evaluate(self, ad: Ad) -> EvaluationResult:
+            del ad
+            raise ModelTransportError("ReadTimeout while calling router.example.test")
+
+    settings = _settings(tmp_path, notify_ai_failures=True)
+    notifier = FakeNotifier()
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=FakeMarktplaatsClient(
+            [Ad(id="m123", title="Pending freezer", url="https://example.test/m123")]
+        ),
+        evaluator=TransportFailingEvaluator(),
+        notifier=notifier,
+        store=SeenStore(settings.state_file),
+        status_store=RuntimeStatusStore(settings.status_file),
+    )
+
+    for _ in range(3):
+        summary = await watcher.run_once()
+        assert summary.evaluation_failures[0].retry_exhausted is False
+
+    assert notifier.ai_failure_alerts == []

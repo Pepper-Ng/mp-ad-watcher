@@ -99,6 +99,7 @@ class EvaluationFailure(BaseModel):
     url: str
     error: str
     stage: Literal["model", "listing_details"] = "model"
+    retry_exhausted: bool = False
 
 
 class WatcherRunSummary(BaseModel):

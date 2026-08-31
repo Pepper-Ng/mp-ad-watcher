@@ -239,13 +239,11 @@ class Watcher:
             except Exception as error:
                 LOGGER.exception("Failed to evaluate ad %s (%s).", ad.id, ad.title)
                 failure_message = _evaluation_failure_message(error)
-                evaluation_failures.append(
-                    EvaluationFailure(
-                        ad_id=ad.id,
-                        title=ad.title,
-                        url=ad.url,
-                        error=failure_message,
-                    )
+                failure = EvaluationFailure(
+                    ad_id=ad.id,
+                    title=ad.title,
+                    url=ad.url,
+                    error=failure_message,
                 )
                 if not self._settings.dry_run and _failure_consumes_retry(error):
                     failed_attempts, exhausted = self._store.mark_model_failure(
@@ -262,6 +260,8 @@ class Watcher:
                             ad.id,
                             failed_attempts,
                         )
+                    failure = failure.model_copy(update={"retry_exhausted": exhausted})
+                evaluation_failures.append(failure)
                 continue
 
             evaluated_ad = EvaluatedAd(ad=ad, result=result)
@@ -334,10 +334,16 @@ class Watcher:
         )
 
     async def _notify_production_ai_failures(self, summary: WatcherRunSummary) -> None:
+        exhausted_failures = [
+            failure
+            for failure in summary.evaluation_failures
+            if failure.stage == "model" and failure.retry_exhausted
+        ]
         if (
             self._settings.dry_run
             or not self._settings.notify_ai_failures
             or self._status_store is None
+            or not exhausted_failures
             or not self._status_store.should_send_ai_failure_alert(summary)
         ):
             return
@@ -351,7 +357,7 @@ class Watcher:
         )
 
         try:
-            send_result = await send_alert(summary.evaluation_failures)
+            send_result = await send_alert(exhausted_failures)
         except Exception:
             LOGGER.exception("Telegram AI-failure alert could not be sent.")
             return
