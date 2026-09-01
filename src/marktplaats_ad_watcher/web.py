@@ -1044,15 +1044,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         {_profile_scope_heading(selection)}
         {_notice(request.query_params.get("notice"))}
         <section class="panel">
-          <form class="filter-form" method="get" action="/evaluations">
+                    <form class="filter-form evaluation-filter-form" method="get" action="/evaluations">
             {_token_hidden_input(request)}
-            <label>Decision
+                        <label class="evaluation-decision-filter">Decision
               <select name="action">
                 {_evaluation_filter_options(action)}
               </select>
             </label>
-                        <label class="checks"><input type="checkbox" name="history" value="all"{older_checked}>
-                            Show review and notify history older than 14 days
+                        <label class="evaluation-history-filter">
+                            <input type="checkbox" name="history" value="all"{older_checked}>
+                            Show older review and notify results
                         </label>
             <button type="submit">Filter</button>
           </form>
@@ -2900,13 +2901,13 @@ def _evaluation_cards(
             f"""
             <article class="evaluation-card">
               <div class="evaluation-heading">
-                {hide_control}
                 <span class="decision decision-{escape(result.next_action)}">
                   {escape(result.next_action)}
                 </span>
                 <strong>{escape(ad.title)}</strong>
                 {test_badge}
                 {profile_badge}
+                                {hide_control}
               </div>
               <p><a href="{escape(ad.url)}" rel="noopener noreferrer" target="_blank">
                 Open Marktplaats ad
@@ -3260,6 +3261,17 @@ def _page(title: str, body: str) -> str:
         .filter-form {{ align-items: end; display: flex; flex-wrap: wrap; gap: 0.75rem; }}
         .filter-form label {{ flex: 0 1 18rem; min-width: 12rem; }}
         .filter-form select {{ max-width: 18rem; }}
+        .evaluation-filter-form {{ align-items: end; }}
+        .evaluation-filter-form .evaluation-decision-filter {{ display: grid; gap: 0.3rem; }}
+        .evaluation-filter-form .evaluation-history-filter {{
+            align-items: center;
+            display: flex;
+            flex: 0 1 auto;
+            gap: 0.5rem;
+            margin-bottom: 0.15rem;
+            min-width: 0;
+        }}
+        .evaluation-history-filter input {{ flex: 0 0 auto; margin: 0; width: auto; }}
         input[type="number"] {{ max-width: 10rem; }}
         .model-limit-form button {{ margin-top: 0.75rem; }}
         .evaluation-card {{

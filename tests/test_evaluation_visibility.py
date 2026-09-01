@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import re
 from typing import Literal
 
 import httpx
@@ -80,6 +81,15 @@ async def test_evaluation_page_filters_old_results_and_hides_confirmed_ad(
     assert "old-review" not in default_page.text
     assert "old-review" in history_page.text
     assert "old-ignore" not in history_page.text
+    assert 'class="filter-form evaluation-filter-form"' in default_page.text
+    assert 'class="evaluation-history-filter"' in default_page.text
+    cards = re.findall(
+        r'<article class="evaluation-card">.*?</article>',
+        default_page.text,
+        flags=re.DOTALL,
+    )
+    recent_card = next(card for card in cards if "recent-review" in card)
+    assert recent_card.index("decision-review") < recent_card.index("dismiss-evaluation")
     assert "Hide evaluation permanently?" in confirmation.text
     assert hidden.status_code == 303
     assert "recent-review" not in after_hide.text
