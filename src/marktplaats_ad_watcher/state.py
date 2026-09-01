@@ -29,6 +29,22 @@ class SeenStore:
         value = record.get("failure_count", 0)
         return value if isinstance(value, int) and value > 0 else 0
 
+    def model_failures(self) -> list[dict[str, Any]]:
+        failures = self._data.get("model_failures", {})
+        if not isinstance(failures, dict):
+            return []
+
+        records = [
+            {"ad_id": str(ad_id), **record}
+            for ad_id, record in failures.items()
+            if isinstance(record, dict)
+        ]
+        return sorted(
+            records,
+            key=lambda record: str(record.get("last_failed_at", "")),
+            reverse=True,
+        )
+
     def mark_model_failure(
         self,
         ad: Ad,

@@ -237,7 +237,12 @@ class Watcher:
                 LOGGER.debug("Budget exhaustion details for ad %s: %s", ad.id, error)
                 continue
             except Exception as error:
-                LOGGER.exception("Failed to evaluate ad %s (%s).", ad.id, ad.title)
+                LOGGER.exception(
+                    "%s Failed to evaluate ad %s (%s).",
+                    _profile_log_context(self._settings),
+                    ad.id,
+                    ad.title,
+                )
                 failure_message = _evaluation_failure_message(error)
                 failure = EvaluationFailure(
                     ad_id=ad.id,
@@ -254,9 +259,10 @@ class Watcher:
                     if exhausted:
                         LOGGER.warning(
                             (
-                                "Giving up on ad %s after %s failed model attempts; "
+                                "%s Giving up on ad %s after %s failed model attempts; "
                                 "it will not be retried again."
                             ),
+                            _profile_log_context(self._settings),
                             ad.id,
                             failed_attempts,
                         )
@@ -428,3 +434,13 @@ def _set_next_run_at(status_store: RuntimeStatusStore, value: datetime) -> datet
 def _profile_error_message(error: Exception) -> str:
     message = str(error).strip() or "No error details were supplied."
     return f"{type(error).__name__}: {message}"[:600]
+
+
+def _profile_log_context(settings: Settings) -> str:
+    if settings.active_profile_name and settings.active_profile_id:
+        return f"[{settings.active_profile_name} · {settings.active_profile_id}]"
+    if settings.active_profile_name:
+        return f"[{settings.active_profile_name}]"
+    if settings.active_profile_id:
+        return f"[{settings.active_profile_id}]"
+    return "[legacy]"

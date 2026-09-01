@@ -23,6 +23,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from marktplaats_ad_watcher.config import Settings, parse_dotenv, write_dotenv
+from marktplaats_ad_watcher.diagnostics import DiagnosticHistoryStore
 from marktplaats_ad_watcher.factory import build_profile_orchestrator
 from marktplaats_ad_watcher.marktplaats import MarktplaatsClient
 from marktplaats_ad_watcher.model_config import (
@@ -154,9 +155,10 @@ DEPLOYMENT_ENV_KEYS = {"WEB_ADMIN_TOKEN"}
 
 
 class RecentLogBuffer(logging.Handler):
-    def __init__(self, *, maximum: int = 200) -> None:
+    def __init__(self, *, history_store: DiagnosticHistoryStore, maximum: int = 200) -> None:
         super().__init__(level=logging.INFO)
         self.entries: deque[dict[str, str]] = deque(maxlen=maximum)
+        self._history_store = history_store
 
     def emit(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
@@ -165,15 +167,17 @@ class RecentLogBuffer(logging.Handler):
             message += f" — {type(error).__name__}: {error}"
         message = _redact_diagnostic_text(message)
         detail = _redact_diagnostic_text(str(getattr(record, "diagnostic_detail", "")))
-        self.entries.append(
-            {
-                "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
-                "level": record.levelname,
-                "logger": record.name,
-                "message": message[:1200],
-                "detail": detail[:8000],
-            }
-        )
+        entry = {
+            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": message[:1200],
+            "detail": detail[:8000],
+        }
+        self.entries.append(entry)
+        if record.levelno >= logging.WARNING:
+            with suppress(OSError):
+                self._history_store.append(entry)
 
 
 def _redact_diagnostic_text(value: str) -> str:
@@ -304,6 +308,11 @@ class WatcherService:
         values = self.read_config()
         results_file = Path(values["RESULTS_FILE"])
         return ModelUsageStore(results_file.parent / "model_usage.json")
+
+    def diagnostics_history_store(self) -> DiagnosticHistoryStore:
+        values = self.read_config()
+        results_file = Path(values["RESULTS_FILE"])
+        return DiagnosticHistoryStore(results_file.parent / "diagnostic_events.jsonl")
 
     def model_usage(self) -> ModelUsageSnapshot:
         return self.model_usage_store().snapshot()
@@ -680,20 +689,52 @@ def _profiles_for_selection(selection: ProfileSelection) -> tuple[SearchProfile 
 
 
 def _diagnostic_entries(
-    entries: deque[dict[str, str]],
+    entries: list[dict[str, str]] | deque[dict[str, str]],
     selection: ProfileSelection,
 ) -> list[dict[str, str]]:
+    attention_entries = [
+        entry
+        for entry in entries
+        if entry.get("level", "").upper() in {"WARNING", "ERROR", "CRITICAL"}
+    ]
     if selection.is_all or selection.profile is None:
-        return list(entries)
+        return attention_entries
     identifiers = (selection.profile.id.lower(), selection.profile.name.lower())
     return [
         entry
-        for entry in entries
+        for entry in attention_entries
         if any(
             identifier in f"{entry['message']} {entry['detail']}".lower()
             for identifier in identifiers
         )
     ]
+
+
+def _model_failures_for_selection(
+    service: WatcherService,
+    selection: ProfileSelection,
+) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    exhausted: list[dict[str, Any]] = []
+    for profile in _profiles_for_selection(selection):
+        settings = service.settings_for_profile(profile)
+        for record in SeenStore(settings.state_file).model_failures():
+            entry = (
+                {**record, "profile_id": profile.id, "profile_name": profile.name}
+                if profile is not None
+                else record
+            )
+            (exhausted if entry.get("exhausted") else pending).append(entry)
+
+    return sorted(pending, key=_failure_record_sort_key, reverse=True) + sorted(
+        exhausted,
+        key=_failure_record_sort_key,
+        reverse=True,
+    )
+
+
+def _failure_record_sort_key(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("last_failed_at", ""))
 
 
 def _read_scoped_evaluations(
@@ -776,7 +817,7 @@ def _profile_log_context(profile: SearchProfile | None) -> str:
 
 def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
     service = WatcherService(env_file=env_file, dry_run=dry_run)
-    recent_logs = RecentLogBuffer()
+    recent_logs = RecentLogBuffer(history_store=service.diagnostics_history_store())
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
@@ -1199,15 +1240,37 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         selection = _select_profile(request, service)
         if isinstance(selection, HTMLResponse):
             return selection
+        failure_records = _model_failures_for_selection(service, selection)
+        current_events = _diagnostic_entries(recent_logs.entries, selection)
+        historical_events = _diagnostic_entries(
+            service.diagnostics_history_store().read_recent(), selection
+        )
         body = f"""
         {_navigation(request, current="diagnostics", selection=selection)}
         {_profile_scope_heading(selection)}
         <section class="panel">
-          <h2>Recent watcher logs</h2>
-                    <p>Shows the latest in-process messages since this container started. A concrete profile
-                    only shows entries that identify that profile; all searches shows the aggregate. For
-                    complete Docker output, open Portainer → Containers → marktplaats-ad-watcher → Logs.</p>
-                    {_recent_logs_table(_diagnostic_entries(recent_logs.entries, selection))}
+          <h2>Pending and abandoned AI failures</h2>
+          <p>Pending items retry only if the listing appears again. Abandoned items used all automatic
+          retries and will not be evaluated again. This persistent state includes failures from before
+          the current container started.</p>
+          {_model_failure_history_table(failure_records, show_profile=selection.is_all)}
+        </section>
+        <section class="panel">
+          <h2>Persistent error history</h2>
+          <p>Warning and error events are retained across container restarts. The latest 200 are shown.</p>
+          {_recent_logs_table(
+              historical_events,
+              empty_message="No warning or error events have been retained yet.",
+          )}
+        </section>
+        <section class="panel">
+          <h2>Current-session attention events</h2>
+          <p>Warnings and errors captured since this container started. Routine successful scheduling
+          entries are omitted.</p>
+          {_recent_logs_table(
+              current_events,
+              empty_message="No warning or error events have occurred since this container started.",
+          )}
         </section>
         """
         return HTMLResponse(_page("Diagnostics", body))
@@ -2652,9 +2715,68 @@ def _evaluation_list(label: str, values: list[str]) -> str:
     return f"<p><strong>{escape(label)}:</strong></p><ul>{items}</ul>"
 
 
-def _recent_logs_table(entries: list[dict[str, str]]) -> str:
+def _model_failure_history_table(
+    records: list[dict[str, Any]],
+    *,
+    show_profile: bool,
+) -> str:
+    if not records:
+        return "<p>No pending or abandoned AI failures are recorded.</p>"
+
+    pending_count = sum(not bool(record.get("exhausted")) for record in records)
+    exhausted_count = len(records) - pending_count
+    rows = []
+    for record in records:
+        exhausted = bool(record.get("exhausted"))
+        status = "Abandoned" if exhausted else "Pending"
+        status_detail = (
+            "No automatic retries remain."
+            if exhausted
+            else "Retries only if this listing appears again."
+        )
+        failure_count = record.get("failure_count")
+        retries = record.get("max_retries")
+        used_attempts = failure_count if isinstance(failure_count, int) else 0
+        total_attempts = retries + 1 if isinstance(retries, int) else "?"
+        title = str(record.get("title") or record.get("ad_id") or "Unknown listing")
+        url = str(record.get("url") or "")
+        listing = (
+            f"<a href='{escape(url)}' target='_blank' rel='noopener noreferrer'>{escape(title)}</a>"
+            if url
+            else escape(title)
+        )
+        profile = (
+            f"<td>{escape(str(record.get('profile_name') or record.get('profile_id') or '—'))}</td>"
+            if show_profile
+            else ""
+        )
+        rows.append(
+            f"""
+            <tr>
+              <td><span class="mini-badge {'status-error' if exhausted else 'status-neutral'}">{status}</span>
+                <br><span class="hint">{status_detail}</span></td>
+              {profile}
+              <td>{listing}</td>
+              <td>{used_attempts} of {total_attempts}</td>
+              <td>{_format_time(record.get('last_failed_at'))}</td>
+              <td class="log-message">{escape(str(record.get('last_error') or 'No error details recorded.'))}</td>
+            </tr>
+            """
+        )
+    profile_header = "<th>Profile</th>" if show_profile else ""
+    return f"""
+    <p><strong>{pending_count}</strong> pending · <strong>{exhausted_count}</strong> abandoned</p>
+    <div class="table-scroll"><table class="log-table">
+      <thead><tr><th>State</th>{profile_header}<th>Listing</th><th>Attempts</th>
+      <th>Last failure</th><th>Error</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table></div>
+    """
+
+
+def _recent_logs_table(entries: list[dict[str, str]], *, empty_message: str) -> str:
     if not entries:
-        return "<p>No log messages have been captured since this container started.</p>"
+        return f"<p>{escape(empty_message)}</p>"
     rows = []
     for entry in reversed(entries):
         level = entry.get("level", "INFO").lower()
