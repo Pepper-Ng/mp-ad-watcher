@@ -45,6 +45,36 @@ class SeenStore:
             reverse=True,
         )
 
+    def model_failure(self, ad_id: str) -> dict[str, Any] | None:
+        record = self._data.get("model_failures", {}).get(ad_id)
+        return {"ad_id": ad_id, **record} if isinstance(record, dict) else None
+
+    def pending_model_failure_ads(self, *, interval: timedelta) -> list[Ad]:
+        now = datetime.now(UTC)
+        candidates: list[Ad] = []
+        for ad_id, record in self._data.get("model_failures", {}).items():
+            if not isinstance(record, dict) or record.get("exhausted"):
+                continue
+            next_retry = _parse_timestamp(record.get("next_retry_at"))
+            last_failed = _parse_timestamp(record.get("last_failed_at"))
+            if next_retry is not None and now < next_retry:
+                continue
+            if next_retry is None and last_failed is not None and now - last_failed < interval:
+                continue
+            title = record.get("title")
+            url = record.get("url")
+            if isinstance(title, str) and title.strip() and isinstance(url, str) and url.strip():
+                candidates.append(Ad(id=str(ad_id), title=title, url=url))
+        return candidates
+
+    def discard_model_failure(self, ad_id: str) -> bool:
+        failures = self._data.get("model_failures", {})
+        if not isinstance(failures, dict) or ad_id not in failures:
+            return False
+        failures.pop(ad_id)
+        self._save()
+        return True
+
     def seen_ad(self, ad_id: str) -> dict[str, Any] | None:
         entry = self._data["seen_ads"].get(ad_id)
         return dict(entry) if isinstance(entry, dict) else None
@@ -123,6 +153,9 @@ class SeenStore:
             "max_retries": max_retries,
             "exhausted": exhausted,
             "exhausted_at": now if exhausted else None,
+            "next_retry_at": (
+                None if exhausted else (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+            ),
         }
 
         if exhausted:

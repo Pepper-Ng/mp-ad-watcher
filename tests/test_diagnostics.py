@@ -90,7 +90,7 @@ async def test_diagnostics_page_shows_persistent_history_and_failure_state(tmp_p
     assert "Abandoned freezer" in page.text
     assert "<strong>1</strong> pending" in page.text
     assert "<strong>1</strong> abandoned" in page.text
-    assert "Retries only if this listing appears again." in page.text
+    assert "Automatic retry after availability check:" in page.text
     assert "No automatic retries remain." in page.text
     assert "Persistent error history" in page.text
     assert "Current-session attention events" in page.text

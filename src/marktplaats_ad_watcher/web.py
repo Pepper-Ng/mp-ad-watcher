@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode
 
+import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -451,6 +452,47 @@ class WatcherService:
         seen_store.mark_seen(ad, result)
         self.pipeline_progress_store_for(profile).save_ai_result(evaluated_ad)
         RuntimeStatusStore(settings.status_file).resolve_evaluation_failure(ad.id)
+        return evaluated_ad
+
+    async def retry_model_failure(
+        self,
+        ad_id: str,
+        profile: SearchProfile | None = None,
+    ) -> EvaluatedAd:
+        settings = self.settings_for_profile(profile)
+        store = SeenStore(settings.state_file)
+        failure = store.model_failure(ad_id)
+        if failure is None:
+            raise ValueError("No pending or stopped model failure exists for this ad.")
+        ad = Ad(
+            id=ad_id,
+            title=str(failure["title"]),
+            url=str(failure["url"]),
+        )
+        client = MarktplaatsClient(
+            timeout_seconds=settings.request_timeout_seconds,
+            user_agent=settings.user_agent,
+        )
+        try:
+            ad = await client.enrich_ad(ad)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in {404, 410}:
+                raise
+            store.hide_ad(ad_id, reason="listing_unavailable")
+            store.discard_model_failure(ad_id)
+            raise ValueError("This listing is no longer available and was hidden.") from error
+
+        result = await build_model_evaluator(settings).evaluate(ad)
+        evaluated_ad = EvaluatedAd(
+            ad=ad,
+            result=result,
+            profile_id=settings.active_profile_id,
+            profile_name=settings.active_profile_name,
+        )
+        store.append_result(settings.results_file, evaluated_ad)
+        store.mark_seen(ad, result)
+        self.pipeline_progress_store_for(profile).save_ai_result(evaluated_ad)
+        RuntimeStatusStore(settings.status_file).resolve_evaluation_failure(ad_id)
         return evaluated_ad
 
     async def send_pipeline_result_to_telegram(
@@ -1154,7 +1196,11 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           intentionally skipped AI evaluation.</p>
           <p class="hint">A currently new ad appears here only after its production AI evaluation
           succeeds. Failed ads remain pending, stay off this page, and retry on later runs.</p>
-          {_seen_ads_table(entries, show_profile=selection.is_all or selection.profile is not None)}
+          {_seen_ads_table(
+              entries,
+              show_profile=selection.is_all or selection.profile is not None,
+              request=request,
+          )}
         </section>
         """
         return HTMLResponse(_page("Seen ads", body))
@@ -1176,6 +1222,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             records: list[PipelineProgressRecord] = []
             for profile in registry.active_profiles:
                 for record in service.pipeline_progress_for(profile):
+                    if record.source != "manual_test":
+                        continue
                     evaluated = record.evaluated_ad.model_copy(
                         update={"profile_id": profile.id, "profile_name": profile.name}
                     )
@@ -1184,9 +1232,9 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             {_navigation(request, current="tools", selection=selection)}
             {_profile_scope_heading(selection)}
             <section class="panel">
-              <h2>Aggregate pipeline history</h2>
+              <h2>Manual AI test history</h2>
               <p>All searches is read-only. Select one profile to fetch ads, test AI, send a
-              saved result, or start a production run.</p>
+              manual test result, or start a production run.</p>
               {_pipeline_progress_cards(request, records, read_only=True)}
             </section>
             """
@@ -1210,6 +1258,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             service.pipeline_progress_for(selection.profile),
             selection.profile,
         )
+        manual_progress = [record for record in progress if record.source == "manual_test"]
         body = f"""
         {_navigation(request, current="tools", selection=selection)}
         {_profile_scope_heading(selection)}
@@ -1231,16 +1280,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         </section>
         <section class="panel">
           <h2>Phase 2 · AI test</h2>
-                    <p>Sends one fetched ad to the configured model. A successful result is saved to
+                    <p>Select an ad above and run <strong>Test AI for selected ad</strong>. A successful result appears
+                    below, is saved to
           Evaluations, marks the ad processed, and clears its pending AI failure. Telegram is
           not called automatically.</p>
-                    {_pipeline_progress_cards(request, progress)}
+                    {_pipeline_progress_cards(request, manual_progress)}
                 </section>
                 <section class="panel">
-                    <h2>Phase 3 · Telegram for a saved result</h2>
-                    <p>Each saved AI result has its own explicit Telegram action. No result means no
-                    per-ad Telegram action is available.</p>
-                    {_pipeline_telegram_actions(request, progress)}
+                    <h2>Phase 3 · Telegram for a manual test</h2>
+                    <p>Only manual test results appear here. Production notifications are handled by the watcher.</p>
+                    {_pipeline_telegram_actions(request, manual_progress)}
                 </section>
                 <section class="panel">
                     <h2>Standalone Telegram test</h2>
@@ -1418,7 +1467,11 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           <p>Pending items retry only if the listing appears again. Abandoned items used all automatic
           retries and will not be evaluated again. This persistent state includes failures from before
           the current container started.</p>
-          {_model_failure_history_table(failure_records, show_profile=selection.is_all)}
+          {_model_failure_history_table(
+              failure_records,
+              show_profile=selection.is_all,
+              request=request,
+          )}
                     <p class="hint">Showing {history_label}. {history_link}</p>
         </section>
         <section class="panel">
@@ -1448,6 +1501,61 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         </section>
         """
         return HTMLResponse(_page("Diagnostics", body))
+
+    async def failure_retry_confirm(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        ad_id = request.path_params["ad_id"]
+        failure = SeenStore(service.settings_for_profile(selection.profile).state_file).model_failure(
+            ad_id
+        )
+        if failure is None:
+            return HTMLResponse(
+                _page("Failure not found", "<p class='alert'>No retryable failure was found.</p>"),
+                status_code=404,
+            )
+        title = escape(str(failure.get("title") or ad_id))
+        body = f"""
+        {_navigation(request, current="diagnostics", selection=selection)}
+        <section class="panel full-run-panel">
+          <h2>Retry AI evaluation?</h2>
+          <p>This makes one immediate availability check and AI evaluation for <strong>{title}</strong>.
+          If it succeeds, the failure is cleared. It does not send Telegram automatically.</p>
+          <form method="post" action="/diagnostics/failures/{quote(ad_id, safe='')}/retry{_token_query(request)}">
+            <button class="warning-button" type="submit">Retry AI now</button>
+            <a href="/diagnostics{_token_query(request)}">Cancel</a>
+          </form>
+        </section>
+        """
+        return HTMLResponse(_page("Confirm AI retry", body))
+
+    async def failure_retry(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        ad_id = request.path_params["ad_id"]
+        try:
+            result = await service.retry_model_failure(ad_id, selection.profile)
+        except Exception as error:
+            return HTMLResponse(
+                _page(
+                    "AI retry failed",
+                    _navigation(request, current="diagnostics", selection=selection)
+                    + _notice(_safe_error("AI retry failed", error), error=""),
+                ),
+                status_code=400,
+            )
+        return RedirectResponse(
+            f"/diagnostics{_query_with_values(request, notice=f'AI retry succeeded for {result.ad.title}.')}",
+            status_code=303,
+        )
 
     async def model_usage(request: Request) -> HTMLResponse:
         denied = _deny_if_needed(request, service)
@@ -2106,6 +2214,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/tools/telegram-test", tools_telegram_test, methods=["POST"]),
             Route("/tools/full-run", full_run_confirm),
             Route("/diagnostics", diagnostics),
+            Route("/diagnostics/failures/{ad_id}/retry", failure_retry_confirm, methods=["GET"]),
+            Route("/diagnostics/failures/{ad_id}/retry", failure_retry, methods=["POST"]),
             Route("/model-usage", model_usage),
             Route("/model-usage/limit", model_usage_limit, methods=["POST"]),
             Route("/model-usage/limit/apply", model_usage_limit_apply, methods=["POST"]),
@@ -2601,7 +2711,7 @@ def _evaluation_action(request: Request) -> str:
 
 def _seen_filter(request: Request) -> str:
     kind = request.query_params.get("kind", "all").strip().lower()
-    return kind if kind in {"all", "baseline", "processed", "recorded"} else "all"
+    return kind if kind in {"all", "baseline", "processed", "retry_stopped", "recorded"} else "all"
 
 
 def _read_seen_ads(path: Path, *, kind: str) -> list[dict[str, Any]]:
@@ -2628,6 +2738,8 @@ def _seen_kind(entry: Mapping[str, Any]) -> str:
         return "baseline"
     if isinstance(entry.get("evaluation"), dict):
         return "processed"
+    if entry.get("model_retry_exhausted") is True:
+        return "retry_stopped"
     return "recorded"
 
 
@@ -2636,6 +2748,7 @@ def _seen_filter_options(selected: str) -> str:
         ("all", "All seen ads"),
         ("baseline", "Baseline"),
         ("processed", "Processed"),
+        ("retry_stopped", "AI retries stopped"),
         ("recorded", "Recorded"),
     ]
     return "".join(
@@ -2644,14 +2757,20 @@ def _seen_filter_options(selected: str) -> str:
     )
 
 
-def _seen_ads_table(entries: list[dict[str, Any]], *, show_profile: bool = False) -> str:
+def _seen_ads_table(
+    entries: list[dict[str, Any]],
+    *,
+    show_profile: bool = False,
+    request: Request | None = None,
+) -> str:
     if not entries:
         return "<p>No seen ads match this filter yet.</p>"
     rows = []
     explanations = {
         "baseline": "Present when tracking started; skipped AI evaluation.",
         "processed": "Processed as a newly discovered ad by the normal pipeline.",
-        "recorded": "Seen reason was not recorded by this version.",
+        "retry_stopped": "AI evaluation failed three times. Retry it manually from this page.",
+        "recorded": "Legacy seen entry without a recorded processing reason.",
     }
     for entry in entries:
         kind = str(entry["kind"])
@@ -2662,6 +2781,20 @@ def _seen_ads_table(entries: list[dict[str, Any]], *, show_profile: bool = False
             confidence = evaluation.get("confidence")
             confidence_text = f" · {float(confidence):.0%}" if confidence is not None else ""
             decision = f"{action}{confidence_text}"
+        retry_action = ""
+        if kind == "retry_stopped" and request is not None:
+            retry_query = (
+                _profile_query(request, str(entry["profile_id"]))
+                if show_profile and entry.get("profile_id")
+                else _token_query(request)
+            )
+            retry_href = (
+                f"/diagnostics/failures/{quote(str(entry['id']), safe='')}/retry"
+                f"{retry_query}"
+            )
+            retry_action = f"<td><a class='button-link' href='{retry_href}'>Retry AI</a></td>"
+        elif request is not None:
+            retry_action = "<td>—</td>"
         rows.append(
             f"""
             <tr>
@@ -2673,12 +2806,13 @@ def _seen_ads_table(entries: list[dict[str, Any]], *, show_profile: bool = False
                 <span class="secondary">{explanations[kind]}</span></td>
               <td>{_format_time(entry.get('first_seen_at'))}</td>
               <td>{decision}</td>
+              {retry_action}
             </tr>
             """
         )
     return f"""
     <div class="table-scroll"><table class="history-table">
-            <thead><tr>{'<th>Profile</th>' if show_profile else ''}<th>Ad</th><th>Seen reason</th><th>First seen</th><th>Decision</th></tr></thead>
+            <thead><tr>{'<th>Profile</th>' if show_profile else ''}<th>Ad</th><th>Seen reason</th><th>First seen</th><th>Decision</th>{'<th>Action</th>' if request is not None else ''}</tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table></div>
     """
@@ -2934,6 +3068,7 @@ def _model_failure_history_table(
     records: list[dict[str, Any]],
     *,
     show_profile: bool,
+    request: Request,
 ) -> str:
     if not records:
         return "<p>No pending or abandoned AI failures are recorded.</p>"
@@ -2944,11 +3079,11 @@ def _model_failure_history_table(
     for record in records:
         exhausted = bool(record.get("exhausted"))
         status = "Retries stopped" if exhausted else "Retry possible"
-        status_detail = (
-            "No automatic retries remain."
-            if exhausted
-            else "Retries only if this listing appears again."
-        )
+        next_retry = record.get("next_retry_at")
+        status_detail = "No automatic retries remain."
+        if not exhausted:
+            retry_time = _format_time(next_retry) if next_retry else "the next scheduled run"
+            status_detail = f"Automatic retry after availability check: {retry_time}."
         failure_count = record.get("failure_count")
         retries = record.get("max_retries")
         used_attempts = failure_count if isinstance(failure_count, int) else 0
@@ -2973,6 +3108,15 @@ def _model_failure_history_table(
             if show_profile
             else ""
         )
+        retry_query = (
+            _profile_query(request, str(record["profile_id"]))
+            if show_profile and record.get("profile_id")
+            else _token_query(request)
+        )
+        retry_href = (
+            f"/diagnostics/failures/{quote(str(record.get('ad_id', '')), safe='')}/retry"
+            f"{retry_query}"
+        )
         rows.append(
             f"""
             <tr>
@@ -2983,6 +3127,7 @@ def _model_failure_history_table(
                             <td>{escape(attempt_text)}</td>
               <td>{_format_time(record.get('last_failed_at'))}</td>
               <td class="log-message">{escape(str(record.get('last_error') or 'No error details recorded.'))}</td>
+                              <td><a class="button-link" href="{retry_href}">Retry AI</a></td>
             </tr>
             """
         )
@@ -2991,7 +3136,7 @@ def _model_failure_history_table(
     <p><strong>{pending_count}</strong> pending · <strong>{exhausted_count}</strong> abandoned</p>
     <div class="table-scroll"><table class="log-table">
     <thead><tr><th>State</th>{profile_header}<th>Listing</th><th>Retry status</th>
-      <th>Last failure</th><th>Error</th></tr></thead>
+    <th>Last failure</th><th>Error</th><th>Action</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table></div>
     """

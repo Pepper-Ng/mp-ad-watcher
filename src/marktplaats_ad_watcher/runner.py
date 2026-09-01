@@ -187,6 +187,7 @@ class Watcher:
 
     async def _run_once(self) -> WatcherRunSummary:
         await self._refresh_match_availability()
+        retry_ads = await self._retry_pending_model_failures()
         fetched_ads = await self._marktplaats_client.fetch_ads(
             self._settings.marktplaats_search_url,
             limit=self._settings.max_ads_per_poll,
@@ -214,7 +215,10 @@ class Watcher:
                 bootstrapped_count=len(ads),
             )
 
-        new_ads = [ad for ad in ads if not self._store.has_seen(ad.id)]
+        retried_ad_ids = {ad.id for ad in retry_ads}
+        new_ads = retry_ads + [
+            ad for ad in ads if not self._store.has_seen(ad.id) and ad.id not in retried_ad_ids
+        ]
         LOGGER.info("Found %s new ads.", len(new_ads))
 
         evaluated_count = 0
@@ -365,12 +369,41 @@ class Watcher:
 
             self._store.mark_availability_checked(ad.id, available=available)
             if not available:
-                LOGGER.warning(
+                LOGGER.info(
                     "%s Hiding unavailable evaluated ad %s (%s).",
                     _profile_log_context(self._settings),
                     ad.id,
                     ad.title,
                 )
+
+    async def _retry_pending_model_failures(self) -> list[Ad]:
+        checker = getattr(self._marktplaats_client, "is_ad_available", None)
+        if not callable(checker) or self._settings.dry_run:
+            return []
+        availability_checker = cast(Callable[[Ad], Awaitable[bool]], checker)
+        retry_ads: list[Ad] = []
+        for ad in self._store.pending_model_failure_ads(interval=AVAILABILITY_CHECK_INTERVAL):
+            try:
+                available = await availability_checker(ad)
+            except Exception:
+                LOGGER.warning(
+                    "%s Could not confirm availability before retrying failed ad %s.",
+                    _profile_log_context(self._settings),
+                    ad.id,
+                    exc_info=True,
+                )
+                continue
+            if available:
+                retry_ads.append(ad)
+                continue
+            self._store.discard_model_failure(ad.id)
+            LOGGER.info(
+                "%s Discarded pending model failure for unavailable ad %s (%s).",
+                _profile_log_context(self._settings),
+                ad.id,
+                ad.title,
+            )
+        return retry_ads
 
     async def _notify_production_ai_failures(self, summary: WatcherRunSummary) -> None:
         exhausted_failures = [
