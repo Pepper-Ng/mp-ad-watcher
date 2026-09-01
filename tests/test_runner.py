@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -298,3 +299,52 @@ async def test_transient_transport_failures_do_not_send_ai_failure_alerts(
         assert summary.evaluation_failures[0].retry_exhausted is False
 
     assert notifier.ai_failure_alerts == []
+
+
+@pytest.mark.asyncio
+async def test_availability_sweep_hides_confirmed_unavailable_matches(tmp_path: Path) -> None:
+    class AvailabilityClient(FakeMarktplaatsClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.checked_ids: list[str] = []
+
+        async def is_ad_available(self, ad: Ad) -> bool:
+            self.checked_ids.append(ad.id)
+            return False
+
+    settings = _settings(tmp_path)
+    ad = Ad(id="m123", title="Unavailable freezer", url="https://example.test/m123")
+    store = SeenStore(settings.state_file)
+    store.mark_seen(
+        ad,
+        EvaluationResult(
+            relevant=True,
+            confidence=0.9,
+            reason="Good match.",
+            next_action="notify",
+        ),
+    )
+    state = store.seen_ad(ad.id)
+    assert state is not None
+    state["last_availability_checked_at"] = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    settings.state_file.write_text(
+        '{"seen_ads":{"m123":' + json.dumps(state) + '}}',
+        encoding="utf-8",
+    )
+
+    client = AvailabilityClient()
+    watcher = Watcher(
+        settings=settings,
+        marktplaats_client=client,
+        evaluator=RecordingEvaluator(),
+        notifier=FakeNotifier(),
+        store=SeenStore(settings.state_file),
+    )
+
+    await watcher.run_once()
+
+    updated = SeenStore(settings.state_file).seen_ad(ad.id)
+    assert client.checked_ids == [ad.id]
+    assert updated is not None
+    assert updated["availability"] == "unavailable"
+    assert updated["hidden_reason"] == "listing_unavailable"

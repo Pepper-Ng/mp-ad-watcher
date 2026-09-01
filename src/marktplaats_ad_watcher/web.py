@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -23,7 +23,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from marktplaats_ad_watcher.config import Settings, parse_dotenv, write_dotenv
-from marktplaats_ad_watcher.diagnostics import DiagnosticHistoryStore
+from marktplaats_ad_watcher.diagnostics import DiagnosticHistoryStore, ModelCallAuditStore
 from marktplaats_ad_watcher.factory import build_profile_orchestrator
 from marktplaats_ad_watcher.marktplaats import MarktplaatsClient
 from marktplaats_ad_watcher.model_config import (
@@ -313,6 +313,11 @@ class WatcherService:
         values = self.read_config()
         results_file = Path(values["RESULTS_FILE"])
         return DiagnosticHistoryStore(results_file.parent / "diagnostic_events.jsonl")
+
+    def model_call_audit_store(self) -> ModelCallAuditStore:
+        values = self.read_config()
+        results_file = Path(values["RESULTS_FILE"])
+        return ModelCallAuditStore(results_file.parent / "model_calls.jsonl")
 
     def model_usage(self) -> ModelUsageSnapshot:
         return self.model_usage_store().snapshot()
@@ -714,8 +719,7 @@ def _model_failures_for_selection(
     service: WatcherService,
     selection: ProfileSelection,
 ) -> list[dict[str, Any]]:
-    pending: list[dict[str, Any]] = []
-    exhausted: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for profile in _profiles_for_selection(selection):
         settings = service.settings_for_profile(profile)
         for record in SeenStore(settings.state_file).model_failures():
@@ -724,17 +728,69 @@ def _model_failures_for_selection(
                 if profile is not None
                 else record
             )
-            (exhausted if entry.get("exhausted") else pending).append(entry)
+            records.append(entry)
 
-    return sorted(pending, key=_failure_record_sort_key, reverse=True) + sorted(
-        exhausted,
-        key=_failure_record_sort_key,
-        reverse=True,
-    )
+    return sorted(records, key=_failure_record_sort_key, reverse=True)
 
 
 def _failure_record_sort_key(entry: Mapping[str, Any]) -> str:
     return str(entry.get("last_failed_at", ""))
+
+
+def _model_calls_for_selection(
+    service: WatcherService,
+    selection: ProfileSelection,
+) -> list[dict[str, str]]:
+    records = service.model_call_audit_store().read_recent(limit=1000)
+    if selection.is_all or selection.profile is None:
+        return records
+    return [
+        record
+        for record in records
+        if record.get("profile_id") in {selection.profile.id, "legacy"}
+    ]
+
+
+def _filter_history_by_age(
+    records: list[dict[str, Any]] | list[dict[str, str]],
+    *,
+    timestamp_key: str,
+    days: int,
+    show_history: bool,
+) -> list[dict[str, Any]] | list[dict[str, str]]:
+    if show_history:
+        return records
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    return [
+        record
+        for record in records
+        if (timestamp := _parse_datetime(record.get(timestamp_key))) is None or timestamp >= cutoff
+    ]
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _show_full_history(request: Request) -> bool:
+    return request.query_params.get("history", "").lower() == "all"
+
+
+def _show_older_evaluations(request: Request) -> bool:
+    return request.query_params.get("history", "").lower() == "all"
+
+
+def _diagnostics_history_link(request: Request, *, show_history: bool) -> str:
+    if show_history:
+        href = _query_with_values(request, history="recent")
+        return f"<a href='/diagnostics{href}'>Show recent history</a>"
+    href = _query_with_values(request, history="all")
+    return f"<a href='/diagnostics{href}'>Show all retained history</a>"
 
 
 def _read_scoped_evaluations(
@@ -742,11 +798,21 @@ def _read_scoped_evaluations(
     selection: ProfileSelection,
     *,
     action: str,
+    show_older: bool = True,
 ) -> list[EvaluatedAd]:
     evaluations: list[EvaluatedAd] = []
+    now = datetime.now(UTC)
     for profile in _profiles_for_selection(selection):
         settings = service.settings_for_profile(profile)
+        seen_store = SeenStore(settings.state_file)
         for evaluation in _read_evaluations(settings.results_file, action=action):
+            if not _evaluation_is_visible(
+                evaluation,
+                seen_store.seen_ad(evaluation.ad.id),
+                now=now,
+                show_older=show_older,
+            ):
+                continue
             if profile is not None and (
                 evaluation.profile_id != profile.id or evaluation.profile_name != profile.name
             ):
@@ -755,6 +821,24 @@ def _read_scoped_evaluations(
                 )
             evaluations.append(evaluation)
     return sorted(evaluations, key=lambda evaluation: evaluation.evaluated_at, reverse=True)
+
+
+def _evaluation_is_visible(
+    evaluation: EvaluatedAd,
+    seen_entry: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+    show_older: bool,
+) -> bool:
+    if seen_entry is not None and seen_entry.get("hidden_at"):
+        return False
+
+    age = now - evaluation.evaluated_at.astimezone(UTC)
+    if evaluation.result.next_action == "ignore":
+        return age <= timedelta(days=7)
+    if evaluation.result.next_action in {"notify", "review"} and not show_older:
+        return age <= timedelta(days=14)
+    return True
 
 
 def _read_scoped_seen_ads(
@@ -767,6 +851,8 @@ def _read_scoped_seen_ads(
     for profile in _profiles_for_selection(selection):
         settings = service.settings_for_profile(profile)
         for entry in _read_seen_ads(settings.state_file, kind=kind):
+            if entry.get("hidden_at"):
+                continue
             if profile is not None:
                 entry = {**entry, "profile_id": profile.id, "profile_name": profile.name}
             entries.append(entry)
@@ -845,6 +931,7 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 {_profile_scope_heading(selection)}
                 {_status_panel(status)}
                 {_last_run_panel(status)}
+                {_listing_visibility_panel(service, selection)}
         {_model_usage_panel(service.model_usage(), request)}
                 <section class="panel">
                     <h2>Activity since reset</h2>
@@ -938,12 +1025,24 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         if isinstance(selection, HTMLResponse):
             return selection
         action = _evaluation_action(request)
-        evaluations = _read_scoped_evaluations(service, selection, action=action)
-        action_query = _query_with_token(request, action=action)
+        show_older = _show_older_evaluations(request)
+        evaluations = _read_scoped_evaluations(
+            service,
+            selection,
+            action=action,
+            show_older=show_older,
+        )
+        action_query = _query_with_values(
+            request,
+            action=action,
+            history="all" if show_older else "recent",
+        )
         filename = _evaluations_download_name(selection)
+        older_checked = " checked" if show_older else ""
         body = f"""
         {_navigation(request, current="evaluations", selection=selection)}
         {_profile_scope_heading(selection)}
+        {_notice(request.query_params.get("notice"))}
         <section class="panel">
           <form class="filter-form" method="get" action="/evaluations">
             {_token_hidden_input(request)}
@@ -952,12 +1051,16 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                 {_evaluation_filter_options(action)}
               </select>
             </label>
+                        <label class="checks"><input type="checkbox" name="history" value="all"{older_checked}>
+                            Show review and notify history older than 14 days
+                        </label>
             <button type="submit">Filter</button>
           </form>
-          <p>{len(evaluations)} evaluation(s). Newest first.</p>
+                    <p>{len(evaluations)} evaluation(s). Newest first. Ignore results older than 7 days,
+                    and unavailable or manually hidden ads, stay hidden.</p>
           <p><a href="/api/evaluations{action_query}" download="{escape(filename)}">Download JSON</a>
           </p>
-          {_evaluation_cards(evaluations)}
+                    {_evaluation_cards(evaluations, hide_request=request)}
         </section>
         <p><a href="/{_token_query(request)}">Back to status</a></p>
         """
@@ -981,6 +1084,48 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
                     f'attachment; filename="{_evaluations_download_name(selection)}"'
                 )
             },
+        )
+
+    async def evaluation_hide_confirm(request: Request) -> HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        ad_id = request.path_params["ad_id"]
+        entry = SeenStore(service.settings_for_profile(selection.profile).state_file).seen_ad(ad_id)
+        if entry is None or not isinstance(entry.get("evaluation"), dict):
+            return HTMLResponse(_page("Evaluation not found", "<p class='alert'>Evaluation not found.</p>"), status_code=404)
+        title = escape(str(entry.get("title") or ad_id))
+        body = f"""
+        {_navigation(request, current="evaluations", selection=selection)}
+        <section class="panel full-run-panel">
+          <h2>Hide evaluation permanently?</h2>
+          <p><strong>{title}</strong> will disappear from Seen ads and Evaluations. Its state is retained,
+          so it cannot be discovered and evaluated again automatically.</p>
+          <form method="post" action="/evaluations/{quote(ad_id, safe='')}/hide{_token_query(request)}">
+            <button class="warning-button" type="submit">Hide permanently</button>
+            <a href="/evaluations{_token_query(request)}">Cancel</a>
+          </form>
+        </section>
+        """
+        return HTMLResponse(_page("Confirm hide", body))
+
+    async def evaluation_hide(request: Request) -> RedirectResponse | HTMLResponse:
+        denied = _deny_if_needed(request, service)
+        if denied:
+            return denied
+        selection = _select_profile(request, service, require_concrete=True)
+        if isinstance(selection, HTMLResponse):
+            return selection
+        ad_id = request.path_params["ad_id"]
+        store = SeenStore(service.settings_for_profile(selection.profile).state_file)
+        if not store.hide_ad(ad_id, reason="manually_hidden"):
+            return HTMLResponse(_page("Evaluation not found", "<p class='alert'>Evaluation not found.</p>"), status_code=404)
+        return RedirectResponse(
+            f"/evaluations{_query_with_values(request, notice='Evaluation hidden permanently.')}",
+            status_code=303,
         )
 
     async def seen_ads(request: Request) -> HTMLResponse:
@@ -1240,11 +1385,30 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
         selection = _select_profile(request, service)
         if isinstance(selection, HTMLResponse):
             return selection
-        failure_records = _model_failures_for_selection(service, selection)
-        current_events = _diagnostic_entries(recent_logs.entries, selection)
-        historical_events = _diagnostic_entries(
-            service.diagnostics_history_store().read_recent(), selection
+        show_history = _show_full_history(request)
+        failure_records = _filter_history_by_age(
+            _model_failures_for_selection(service, selection),
+            timestamp_key="last_failed_at",
+            days=14,
+            show_history=show_history,
         )
+        current_events = _diagnostic_entries(recent_logs.entries, selection)
+        historical_events = _filter_history_by_age(
+            _diagnostic_entries(
+            service.diagnostics_history_store().read_recent(), selection
+            ),
+            timestamp_key="timestamp",
+            days=14,
+            show_history=show_history,
+        )
+        model_calls = _filter_history_by_age(
+            _model_calls_for_selection(service, selection),
+            timestamp_key="timestamp",
+            days=14,
+            show_history=show_history,
+        )
+        history_link = _diagnostics_history_link(request, show_history=show_history)
+        history_label = "all retained history" if show_history else "the last 14 days"
         body = f"""
         {_navigation(request, current="diagnostics", selection=selection)}
         {_profile_scope_heading(selection)}
@@ -1254,14 +1418,23 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
           retries and will not be evaluated again. This persistent state includes failures from before
           the current container started.</p>
           {_model_failure_history_table(failure_records, show_profile=selection.is_all)}
+                    <p class="hint">Showing {history_label}. {history_link}</p>
         </section>
         <section class="panel">
           <h2>Persistent error history</h2>
-          <p>Warning and error events are retained across container restarts. The latest 200 are shown.</p>
+                    <p>Warning and error events are retained across container restarts. Showing {history_label}.</p>
           {_recent_logs_table(
               historical_events,
               empty_message="No warning or error events have been retained yet.",
           )}
+                    <p class="hint">{history_link}</p>
+                </section>
+                <section class="panel">
+                    <h2>Recent AI calls</h2>
+                    <p>Every real provider attempt is recorded with its model, outcome, and a capped response body.
+                    Prompts, API keys, and request headers are never stored. Showing {history_label}.</p>
+                    {_model_call_audit_table(model_calls, show_profile=selection.is_all)}
+                    <p class="hint">{history_link}</p>
         </section>
         <section class="panel">
           <h2>Current-session attention events</h2>
@@ -1922,6 +2095,8 @@ def create_web_app(*, env_file: Path, dry_run: bool = False) -> Starlette:
             Route("/api/status", status_json),
             Route("/evaluations", evaluations),
             Route("/api/evaluations", evaluations_json),
+            Route("/evaluations/{ad_id}/hide", evaluation_hide_confirm, methods=["GET"]),
+            Route("/evaluations/{ad_id}/hide", evaluation_hide, methods=["POST"]),
             Route("/seen", seen_ads),
             Route("/tools", tools),
             Route("/tools/fetch", tools_fetch, methods=["POST"]),
@@ -2244,6 +2419,34 @@ def _status_panel(status: RuntimeStatus) -> str:
       {error}
     </section>
     """
+
+
+def _listing_visibility_panel(service: WatcherService, selection: ProfileSelection) -> str:
+        active_matches = 0
+        unavailable = 0
+        manually_hidden = 0
+        for profile in _profiles_for_selection(selection):
+                settings = service.settings_for_profile(profile)
+                for entry in _read_seen_ads(settings.state_file, kind="all"):
+                        if entry.get("hidden_reason") == "listing_unavailable":
+                                unavailable += 1
+                                continue
+                        if entry.get("hidden_reason") == "manually_hidden":
+                                manually_hidden += 1
+                                continue
+                        evaluation = entry.get("evaluation")
+                        if isinstance(evaluation, dict) and evaluation.get("next_action") in {"notify", "review"}:
+                                active_matches += 1
+        return f"""
+        <section class="panel">
+            <h2>Match visibility</h2>
+            <div class="metric-grid">
+                {_metric("Active review / notify", active_matches)}
+                {_metric("Unavailable hidden", unavailable)}
+                {_metric("Manually hidden", manually_hidden)}
+            </div>
+        </section>
+        """
 
 
 def _last_run_panel(status: RuntimeStatus) -> str:
@@ -2656,6 +2859,7 @@ def _evaluation_cards(
     *,
     test_only: bool = False,
     show_profile: bool = True,
+    hide_request: Request | None = None,
 ) -> str:
     if not evaluations:
         return "<p>No evaluations match this filter yet.</p>"
@@ -2683,10 +2887,20 @@ def _evaluation_cards(
                 f"<span class='mini-badge'>"
                 f"{escape(evaluation.profile_name)} · {escape(evaluation.profile_id or '')}</span>"
             )
+        hide_control = ""
+        if hide_request is not None:
+            hide_href = (
+                f"/evaluations/{quote(ad.id, safe='')}/hide{_token_query(hide_request)}"
+            )
+            hide_control = (
+                f"<a class='dismiss-evaluation' href='{hide_href}' "
+                "title='Hide permanently' aria-label='Hide permanently'>×</a>"
+            )
         cards.append(
             f"""
             <article class="evaluation-card">
               <div class="evaluation-heading">
+                {hide_control}
                 <span class="decision decision-{escape(result.next_action)}">
                   {escape(result.next_action)}
                 </span>
@@ -2728,7 +2942,7 @@ def _model_failure_history_table(
     rows = []
     for record in records:
         exhausted = bool(record.get("exhausted"))
-        status = "Abandoned" if exhausted else "Pending"
+        status = "Retries stopped" if exhausted else "Retry possible"
         status_detail = (
             "No automatic retries remain."
             if exhausted
@@ -2737,7 +2951,15 @@ def _model_failure_history_table(
         failure_count = record.get("failure_count")
         retries = record.get("max_retries")
         used_attempts = failure_count if isinstance(failure_count, int) else 0
-        total_attempts = retries + 1 if isinstance(retries, int) else "?"
+        total_attempts = retries + 1 if isinstance(retries, int) else 0
+        retries_left = max(0, total_attempts - used_attempts)
+        attempt_text = (
+            f"{used_attempts} failed attempt(s) · retries stopped"
+            if exhausted
+            else f"{used_attempts} failed attempt(s) · {retries_left} retry left"
+            if retries_left == 1
+            else f"{used_attempts} failed attempt(s) · {retries_left} retries left"
+        )
         title = str(record.get("title") or record.get("ad_id") or "Unknown listing")
         url = str(record.get("url") or "")
         listing = (
@@ -2753,11 +2975,11 @@ def _model_failure_history_table(
         rows.append(
             f"""
             <tr>
-              <td><span class="mini-badge {'status-error' if exhausted else 'status-neutral'}">{status}</span>
+                            <td><span class="mini-badge {'status-error' if exhausted else 'status-warning'}">{status}</span>
                 <br><span class="hint">{status_detail}</span></td>
               {profile}
               <td>{listing}</td>
-              <td>{used_attempts} of {total_attempts}</td>
+                            <td>{escape(attempt_text)}</td>
               <td>{_format_time(record.get('last_failed_at'))}</td>
               <td class="log-message">{escape(str(record.get('last_error') or 'No error details recorded.'))}</td>
             </tr>
@@ -2767,8 +2989,56 @@ def _model_failure_history_table(
     return f"""
     <p><strong>{pending_count}</strong> pending · <strong>{exhausted_count}</strong> abandoned</p>
     <div class="table-scroll"><table class="log-table">
-      <thead><tr><th>State</th>{profile_header}<th>Listing</th><th>Attempts</th>
+    <thead><tr><th>State</th>{profile_header}<th>Listing</th><th>Retry status</th>
       <th>Last failure</th><th>Error</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table></div>
+    """
+
+
+def _model_call_audit_table(records: list[dict[str, str]], *, show_profile: bool) -> str:
+    if not records:
+        return "<p>No AI calls match this time range yet.</p>"
+
+    rows = []
+    for record in reversed(records):
+        outcome = record.get("outcome", "unknown")
+        successful = outcome == "success"
+        outcome_class = "status-ok" if successful else "status-error"
+        profile = (
+            f"<td>{escape(record.get('profile_name') or record.get('profile_id') or '—')}</td>"
+            if show_profile
+            else ""
+        )
+        decision = record.get("action", "")
+        confidence = record.get("confidence", "")
+        decision_text = " · ".join(value for value in (decision, confidence) if value) or "—"
+        response = record.get("response", "")
+        error = record.get("error", "")
+        detail = ""
+        if response:
+            detail += (
+                "<details class='diagnostic-detail'><summary>Show model response</summary>"
+                f"<pre>{escape(response)}</pre></details>"
+            )
+        if error:
+            detail += f"<p class='alert'>{escape(error)}</p>"
+        rows.append(
+            f"""
+            <tr>
+              <td>{_format_time(record.get('timestamp'))}</td>
+              {profile}
+              <td>{escape(record.get('provider', ''))}<br><span class='hint'>{escape(record.get('model', ''))}</span></td>
+              <td><span class="mini-badge {outcome_class}">{escape(outcome)}</span></td>
+              <td>{escape(decision_text)}{detail}</td>
+            </tr>
+            """
+        )
+    profile_header = "<th>Profile</th>" if show_profile else ""
+    return f"""
+    <div class="table-scroll"><table class="log-table">
+      <thead><tr><th>Time</th>{profile_header}<th>Provider / model</th><th>Outcome</th>
+      <th>Result / response</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table></div>
     """
@@ -2921,6 +3191,7 @@ def _page(title: str, body: str) -> str:
         }}
         .status-ok, .status-running, .seen-processed {{ background: #dcefe3; color: #145c31; }}
         .status-error {{ background: #f7dddd; color: #8a2020; }}
+        .status-warning {{ background: #fff1cb; color: #775700; }}
         .status-neutral, .seen-recorded {{ background: #e8eaed; color: #4f5358; }}
         .seen-baseline {{ background: #e4ecf6; color: #315f8c; }}
         .status-list {{
@@ -2999,6 +3270,16 @@ def _page(title: str, body: str) -> str:
         }}
         .evaluation-card p {{ margin: 0.55rem 0; }}
         .evaluation-heading {{ align-items: center; display: flex; flex-wrap: wrap; gap: 0.6rem; }}
+        .dismiss-evaluation {{
+            color: #8a2020;
+            font-size: 1.4rem;
+            font-weight: 700;
+            line-height: 1;
+            margin-left: auto;
+            padding: 0.1rem 0.35rem;
+            text-decoration: none;
+        }}
+        .dismiss-evaluation:hover {{ background: #f7dddd; border-radius: 4px; }}
         .decision {{
             border-radius: 1rem;
             color: white;

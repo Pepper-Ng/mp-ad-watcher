@@ -54,6 +54,21 @@ class MarktplaatsClient:
 
         return enrich_ad_from_detail_html(ad, response.text)
 
+    async def is_ad_available(self, ad: Ad) -> bool:
+        """Return false only for an explicitly removed listing; raise for transient failures."""
+
+        async with httpx.AsyncClient(
+            timeout=self._timeout_seconds,
+            follow_redirects=True,
+            headers=self._headers,
+        ) as client:
+            response = await client.get(ad.url)
+
+        if response.status_code in {404, 410}:
+            return False
+        response.raise_for_status()
+        return True
+
 
 def normalize_ads(payload: Any) -> list[Ad]:
     ads: list[Ad] = []

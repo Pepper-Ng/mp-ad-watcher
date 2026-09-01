@@ -26,6 +26,7 @@ from marktplaats_ad_watcher.usage import ModelDailyLimitExceeded
 
 LOGGER = logging.getLogger(__name__)
 MAX_MODEL_RETRIES = 2
+AVAILABILITY_CHECK_INTERVAL = timedelta(hours=2)
 
 
 class AdFetcher(Protocol):
@@ -185,6 +186,7 @@ class Watcher:
         return summary
 
     async def _run_once(self) -> WatcherRunSummary:
+        await self._refresh_match_availability()
         fetched_ads = await self._marktplaats_client.fetch_ads(
             self._settings.marktplaats_search_url,
             limit=self._settings.max_ads_per_poll,
@@ -338,6 +340,37 @@ class Watcher:
             evaluation_failed_count=len(evaluation_failures),
             evaluation_failures=evaluation_failures,
         )
+
+    async def _refresh_match_availability(self) -> None:
+        if self._settings.dry_run:
+            return
+        checker = getattr(self._marktplaats_client, "is_ad_available", None)
+        if not callable(checker):
+            return
+        availability_checker = cast(Callable[[Ad], Awaitable[bool]], checker)
+
+        for ad in self._store.availability_check_candidates(
+            interval=AVAILABILITY_CHECK_INTERVAL
+        ):
+            try:
+                available = await availability_checker(ad)
+            except Exception:
+                LOGGER.warning(
+                    "%s Could not check whether ad %s is still available.",
+                    _profile_log_context(self._settings),
+                    ad.id,
+                    exc_info=True,
+                )
+                continue
+
+            self._store.mark_availability_checked(ad.id, available=available)
+            if not available:
+                LOGGER.warning(
+                    "%s Hiding unavailable evaluated ad %s (%s).",
+                    _profile_log_context(self._settings),
+                    ad.id,
+                    ad.title,
+                )
 
     async def _notify_production_ai_failures(self, summary: WatcherRunSummary) -> None:
         exhausted_failures = [

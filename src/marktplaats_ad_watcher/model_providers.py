@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import httpx
 
 from marktplaats_ad_watcher.config import Settings
+from marktplaats_ad_watcher.diagnostics import ModelCallAuditStore
 from marktplaats_ad_watcher.evaluation import (
     EVALUATION_JSON_SCHEMA,
     EvaluationPrompt,
@@ -63,6 +67,7 @@ class HttpModelEvaluator(ABC):
         self._settings = settings
         self._preset = provider_preset(settings.model_provider)
         self._usage = ModelUsageStore(settings.global_model_usage_file)
+        self._audit = ModelCallAuditStore(settings.data_root / "model_calls.jsonl")
 
     async def evaluate(self, ad: Ad) -> EvaluationResult:
         prompt = build_evaluation_prompt(
@@ -84,6 +89,10 @@ class HttpModelEvaluator(ABC):
                 break
             except httpx.RequestError as error:
                 last_transport_error = error
+                self._record_audit(
+                    outcome="transport_error",
+                    error=_transport_error_message(error, endpoint),
+                )
                 continue
             except Exception:
                 reservation.release()
@@ -100,23 +109,48 @@ class HttpModelEvaluator(ABC):
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             reservation.commit()
+            self._record_audit(
+                outcome=f"http_{response.status_code}",
+                error=str(error),
+                response=response.text,
+            )
             raise ModelProviderError(str(error)) from error
 
+        response_text = ""
+        response_detail = ""
         try:
             response_payload = response.json()
+            response_detail = _serialize_response(response_payload)
             if not isinstance(response_payload, dict):
                 raise ModelOutputError(
                     "Model response was not a JSON object at the protocol level."
                 )
-            result = parse_evaluation(self.response_text(response_payload))
-        except ModelOutputError:
+            response_text = self.response_text(response_payload)
+            result = parse_evaluation(response_text)
+        except ModelOutputError as error:
             reservation.commit()
+            self._record_audit(
+                outcome="invalid_output",
+                error=str(error),
+                response=response_text or response_detail,
+            )
             raise
         except Exception as error:
             reservation.commit()
+            self._record_audit(
+                outcome="invalid_output",
+                error=str(error),
+                response=response_text or response_detail,
+            )
             raise ModelOutputError(str(error)) from error
 
         reservation.commit()
+        self._record_audit(
+            outcome="success",
+            response=response_text,
+            action=result.next_action,
+            confidence=f"{result.confidence:.2f}",
+        )
         return result
 
     @abstractmethod
@@ -132,6 +166,30 @@ class HttpModelEvaluator(ABC):
             "Content-Type": "application/json",
             "User-Agent": self._settings.user_agent,
         }
+
+    def _record_audit(
+        self,
+        *,
+        outcome: str,
+        response: str = "",
+        error: str = "",
+        action: str = "",
+        confidence: str = "",
+    ) -> None:
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "profile_id": self._settings.active_profile_id or "legacy",
+            "profile_name": self._settings.active_profile_name or "",
+            "provider": self._settings.model_provider,
+            "model": self._settings.model_name,
+            "outcome": outcome,
+            "action": action,
+            "confidence": confidence,
+            "error": error[:1200],
+            "response": response[:8000],
+        }
+        with suppress(OSError):
+            self._audit.append(record)
 
 
 class OpenAICompatibleEvaluator(HttpModelEvaluator):
@@ -379,6 +437,13 @@ class FallbackEvaluator:
 
 def _endpoint(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _serialize_response(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _transport_error_message(error: httpx.RequestError, endpoint: str) -> str:

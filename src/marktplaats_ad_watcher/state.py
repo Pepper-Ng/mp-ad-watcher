@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,52 @@ class SeenStore:
             key=lambda record: str(record.get("last_failed_at", "")),
             reverse=True,
         )
+
+    def seen_ad(self, ad_id: str) -> dict[str, Any] | None:
+        entry = self._data["seen_ads"].get(ad_id)
+        return dict(entry) if isinstance(entry, dict) else None
+
+    def hide_ad(self, ad_id: str, *, reason: str) -> bool:
+        entry = self._data["seen_ads"].get(ad_id)
+        if not isinstance(entry, dict):
+            return False
+        now = datetime.now(UTC).isoformat()
+        entry["hidden_at"] = now
+        entry["hidden_reason"] = reason
+        self._save()
+        return True
+
+    def availability_check_candidates(self, *, interval: timedelta) -> list[Ad]:
+        now = datetime.now(UTC)
+        candidates: list[Ad] = []
+        for ad_id, entry in self._data["seen_ads"].items():
+            if not isinstance(entry, dict) or entry.get("availability") == "unavailable":
+                continue
+            result = entry.get("evaluation")
+            if not isinstance(result, dict) or result.get("next_action") not in {"notify", "review"}:
+                continue
+            checked_at = _parse_timestamp(entry.get("last_availability_checked_at"))
+            if checked_at is not None and now - checked_at < interval:
+                continue
+            title = entry.get("title")
+            url = entry.get("url")
+            if isinstance(title, str) and title.strip() and isinstance(url, str) and url.strip():
+                candidates.append(Ad(id=str(ad_id), title=title, url=url))
+        return candidates
+
+    def mark_availability_checked(self, ad_id: str, *, available: bool) -> bool:
+        entry = self._data["seen_ads"].get(ad_id)
+        if not isinstance(entry, dict):
+            return False
+        now = datetime.now(UTC).isoformat()
+        entry["last_availability_checked_at"] = now
+        entry["availability"] = "available" if available else "unavailable"
+        if not available:
+            entry["hidden_at"] = now
+            entry["hidden_reason"] = "listing_unavailable"
+            entry["unavailable_at"] = now
+        self._save()
+        return True
 
     def mark_model_failure(
         self,
@@ -101,6 +147,8 @@ class SeenStore:
         }
         if result is not None:
             entry["evaluation"] = result.model_dump(mode="json")
+            entry["availability"] = "available"
+            entry["last_availability_checked_at"] = datetime.now(UTC).isoformat()
 
         existing = self._data["seen_ads"].get(ad.id)
         if isinstance(existing, dict) and "first_seen_at" in existing:
@@ -190,3 +238,12 @@ class SeenStore:
             output.write("\n")
 
         temporary_path.replace(self._path)
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

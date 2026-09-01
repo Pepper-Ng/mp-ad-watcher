@@ -40,3 +40,39 @@ class DiagnosticHistoryStore:
                     entries.append(entry)
 
         return entries[-limit:]
+
+
+class ModelCallAuditStore:
+    """Append-only audit of model calls with sanitized model output only."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def append(self, record: Mapping[str, str]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(dict(record), ensure_ascii=False, sort_keys=True))
+            output.write("\n")
+
+    def read_recent(self, *, limit: int = 200) -> list[dict[str, str]]:
+        if limit < 1 or not self._path.exists():
+            return []
+
+        records: list[dict[str, str]] = []
+        with self._path.open("r", encoding="utf-8") as input_file:
+            for line in input_file:
+                try:
+                    loaded = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(loaded, dict):
+                    continue
+                record = {
+                    key: value
+                    for key, value in loaded.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+                if {"timestamp", "provider", "model", "outcome"} <= record.keys():
+                    records.append(record)
+
+        return records[-limit:]

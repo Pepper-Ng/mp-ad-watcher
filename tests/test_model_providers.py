@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from marktplaats_ad_watcher.config import Settings
+from marktplaats_ad_watcher.diagnostics import ModelCallAuditStore
 from marktplaats_ad_watcher.evaluation import build_evaluation_prompt
 from marktplaats_ad_watcher.model_providers import (
     AnthropicMessagesEvaluator,
@@ -260,6 +261,11 @@ async def test_openai_compatible_evaluator_parses_valid_response(
 
     assert result.next_action == "notify"
     assert captured["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
+    audit = ModelCallAuditStore(tmp_path / "model_calls.jsonl").read_recent()
+    assert audit[0]["outcome"] == "success"
+    assert audit[0]["model"] == "deepseek-v4-flash"
+    assert audit[0]["action"] == "notify"
+    assert '"relevant":true' in audit[0]["response"]
 
 
 def test_native_response_parsers_accept_documented_shapes(tmp_path: Path) -> None:
